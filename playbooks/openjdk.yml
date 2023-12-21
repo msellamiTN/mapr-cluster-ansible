@@ -1,0 +1,191 @@
+---
+#
+# Playbook Name: openjdk
+#
+# Copyright 2013, MapR Technologies
+#
+# Purpose: Install OpenJDK 1.8 appropriately for Linux release
+#
+# Run with
+#    ansible-playbook <playbook>
+# on a local system, or
+#    ansible-playbook <playbook> -e "cloud_user=ec2-user" -e "cloud_connection=ssh"
+# when accessing remote systems (for example in the Amazon cloud)
+#
+
+- name: Installing OpenJDK if required
+  hosts: all
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    # Please check that max install_jdk1x version correspond to max_jdk variable
+    # in group_vars/all file. It`s mandatory for consistent Java prereq check.
+    mapr_installer_env_script: "/tmp/mapr_installer_env.sh"
+    install_jdk18: False
+    install_jdk110: False
+    java_11_securiy_policy_path_rh: "/usr/lib/jvm/java-11-openjdk/conf/security/java.security"
+    java_11_securiy_policy_path_ubuntu: "/usr/lib/jvm/java-11-openjdk-amd64/conf/security/java.security"
+
+  tasks:
+  - name: Get MapR version
+    set_fact:
+      mapr_version_triple: "{{ version | replace('.', '') }}"
+
+  - debug: var=version
+  - debug: var=mapr_version_triple
+
+  - set_fact: min_java_version="{{ prereq_values.jdk.support_matrix["6.2.0"].min }}"
+    when: mapr_version_triple | int >= 620
+  - set_fact: max_java_version="{{ prereq_values.jdk.support_matrix["6.2.0"].max }}"
+    when: mapr_version_triple | int >= 620
+  - set_fact: min_java_version="{{ prereq_values.jdk.support_matrix["6.0.0"].min }}"
+    when: mapr_version_triple | int >= 600 and mapr_version_triple | int < 620
+  - set_fact: max_java_version="{{ prereq_values.jdk.support_matrix["6.0.0"].max }}"
+    when: mapr_version_triple | int >= 600 and mapr_version_triple | int < 620
+
+#  # need to copy over env.sh so that we can do some checks form the openjdk_check
+#  # plugin to see if we have a JRE only condition
+#  - template:
+#        src={{ mapr_home }}/installer/bin/env.sh
+#        dest={{ mapr_installer_env_script }}
+#        owner=root
+#        group=root
+#        mode=0644
+
+#  - name: Searching for required openJDK versions
+#    action: "openjdk_check.sh MIN_JAVA_VERSION={{ min_java_version }} MAX_JAVA_VERSION={{ max_java_version }}
+#        JAVA_ENV_CHECK_SCRIPT={{ mapr_installer_env_script }} IS_UPGRADE={% if is_upgrade|bool == True %}1{% else %}0{% endif %}"
+#    register: installed_jdk
+#    ignore_errors: True
+#
+#  - debug: var=installed_jdk
+#    when: jdk_debug|default(0)
+
+  # A few words about this.
+  # While we support mixing OSes, it is not common to do so.
+  # And we do not support mixing SLES 12 with SLES 15 for example.
+  # We assume that if OSes got to be mixed - they will share the same minimal java version.
+  # And we do not install JRE - JDK only. But we plan to use JRE :)
+  # And we do not want user to pre-install JDK for us.
+  - name: Install Java1.8
+    set_fact:
+      install_jdk18: True
+    when: min_java_version == "1.8"
+
+  - name: Install Java1.11
+    set_fact:
+      install_jdk110: True
+    when: min_java_version == "11.0"
+
+
+#  - set_fact: install_jdk18=True
+#    when: (installed_jdk is changed and
+#           ((installed_jdk.version is version_compare('1.8', '==') and
+#             min_java_version is version_compare('1.8', '<=') and
+#             installed_jdk.jre_only == '1') or
+#            (installed_jdk.version is version_compare(min_java_version, '<') and
+#             min_java_version is version_compare('1.8', '==')))) or
+#            (installed_jdk is not changed and
+#             min_java_version is version_compare('1.8', '=='))
+#  - debug: msg="Will install automatically OpenJDK 1.8"
+#    when: install_jdk18
+#
+#  - set_fact: install_jdk110=True
+#    when: (installed_jdk is changed and
+#           ((installed_jdk.version is version_compare('1.8', '==') and
+#             min_java_version is version_compare('11.0', '<=') and
+#             installed_jdk.jre_only == '1') or
+#            (installed_jdk.version is version_compare(min_java_version, '<') and
+#             min_java_version is version_compare('11.0', '==')))) or
+#            (installed_jdk.version is version_compare(min_java_version, '==') and
+#             installed_jdk.jre_only == '1') or
+#            (installed_jdk is not changed and
+#             min_java_version is version_compare('11.0', '=='))
+#  - debug: msg="Will install automatically OpenJDK 11"
+#    when: install_jdk110
+
+  # Upgrade or install jdk for Debian/Ubuntu
+  - block:
+    - fail: msg="Need to manually install jdk 1.8 for Ubuntu version less than 16.04"
+      when: ansible_distribution_version is version_compare('16.04', '<') and
+            min_java_version is version_compare('1.8', '==') and
+                (installed_jdk is changed and
+                     installed_jdk.version is version_compare('1.7', '<='))
+
+    - fail: msg="Need to manually install jdk 1.11 for Ubuntu version 16.04"
+      when: ansible_distribution_version is version_compare('16.04', '==') and
+            install_jdk110
+
+    - apt:
+        name:
+         - x11-utils
+         - openjdk-8-jdk
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: apt_jdk8_install
+      until: apt_jdk8_install is succeeded
+      when: install_jdk18
+
+    - apt:
+        name:
+         - openjdk-11-jdk
+         - x11-utils
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: apt_jdk11_install
+      until: apt_jdk11_install is succeeded
+      when: install_jdk110
+
+    when: ansible_os_family == 'Debian'
+
+  # Upgrade or install jdk for CentOS/RH
+  - block:
+    - yum:
+        name: java-1.8.0-openjdk-devel
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: yum_jdk8_install
+      until: yum_jdk8_install is succeeded
+      when: install_jdk18
+
+    - yum:
+        name: java-11-openjdk-devel
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: yum_jdk11_install
+      until: yum_jdk11_install is succeeded
+      when: install_jdk110
+
+    when: ansible_os_family == 'RedHat'
+
+  # Upgrade or install jdk for Suse
+  - block:
+    - zypper:
+        name: java-1_8_0-openjdk-devel
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: zypper_jdk8_install
+      until: zypper_jdk8_install is succeeded
+      when: install_jdk18
+
+    - zypper:
+        name: java-11-openjdk-devel
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: zypper_jdk11_install
+      until: zypper_jdk11_install is succeeded
+      when: install_jdk110
+
+    when: ansible_os_family == 'Suse'
+
+  - mapr_state.py: state=4

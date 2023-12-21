@@ -1,0 +1,395 @@
+---
+#
+# Playbook Name:: check
+#
+# Copyright 2017, MapR Technologies
+#
+# Run with
+#    ansible-playbook <playbook>
+# on a local system, or
+#    ansible-playbook <playbook> -e "cloud_user=ec2-user" -e "cloud_connection=ssh"
+# when accessing remote systems (for example in the Amazon cloud)
+#
+
+- name: Python presence check
+  # We only want to gather_facts once, and we do so right before we run mapr_prereq.py below
+  gather_facts: False
+  hosts: all
+  max_fail_percentage: 80
+  serial: "{{ forks }}"
+
+  vars:
+
+    # Do not use with  "{{ script|quote }}"
+    # Apt script will check for updates and try to install python package
+    check_pip: |
+      if command -v pip; then
+        pip -h > /dev/null
+        if [ "$?" -ne 0 ]; then
+          echo "ERROR: Can not install pip. Install it manually please."
+          exit 10
+        fi
+      else
+        pip3 -h > /dev/null
+        if [ "$?" -ne 0 ]; then
+          echo "ERROR: Can not install pip3. Install it manually please."
+          exit 10
+        fi
+      fi
+      echo "Pip found and working"
+
+    repo_url_old: "package.mapr.com"
+    repo_path_redhat: "/etc/yum.repos.d/"
+    repo_path_suse: "/etc/zypp/repos.d/"
+    core_repo_file: "mapr_core.repo"
+    eco_repo_file: "mapr_ecosystem.repo"
+    os_script_check: |
+      if [ -f /usr/bin/apt ]; then
+          echo "Debian"
+      elif [ -f /usr/bin/yum ]; then
+          echo "RedHat"
+      elif [ -f /usr/bin/zypper ]; then
+          echo "SUSE"
+      else
+          echo "Unknown"
+      fi
+    apt_script: |
+      if command -v python3 &>/dev/null; then echo "Python 3 found" && exit 0; fi
+      if [ -f /usr/bin/apt ]; then
+        apt-get update -qq
+        apt-get install -qq -y python-minimal
+        command -v python &>/dev/null
+        if [ ! $? -eq 0 ]; then
+          echo "ERROR: Python missing!"
+        fi
+        echo "Python 2 updated to latest version from system repo"
+      fi
+    # Yum build with python, so some interpreter will present on centos 6-7,
+    # while on CentOS 8 we install python3 by default.
+    rhel_script: |
+      if [ -f /etc/redhat-release ]; then
+              OS=redhat
+              OSVER=$(grep -o -P '[0-9\.]+' /etc/redhat-release | cut -d. -f1,2)
+              if [[ $OSVER =~  ^8.[0-9] ]]; then
+                echo "Installing python3 for RHEL-like system"
+                dnf install -q python3 -y
+              fi
+              # Check for python presence
+              command -v python3 &>/dev/null
+              if [ ! $? -eq 0 ]; then
+                echo "ERROR: Python missing!"
+                exit 1
+              fi
+              echo "Python3 installed and ready to work"
+              exit 0 # We are good, exiting script
+      fi
+      if command -v python3 &>/dev/null; then echo "Python 3 found" && exit 0; fi
+      if [ -f /usr/bin/yum ]; then
+        yum --nogpgcheck check-update
+        yum --nogpgcheck install -y python
+        # Check for python presence
+        command -v python &>/dev/null
+        if [ ! $? -eq 0 ]; then
+          echo "ERROR: Python missing!"
+        fi
+        echo "Python 2 updated to latest version from system repo"
+      fi
+
+    # SLES have python, but better to update python last 2.7/3.x if possible.
+    suse_script: |
+      if [ -f /usr/bin/zypper ]; then
+        zypper --quiet --no-gpg-checks --non-interactive refresh
+        if grep "15\." -q /etc/os-release; then
+          # SLES 15
+          zypper --quiet --no-gpg-checks --non-interactive install python python3 python3-lxml
+        elif grep "12\." -q /etc/os-release; then
+          # SLES 12
+          zypper --quiet --no-gpg-checks --non-interactive install python python-xml python-lxml python3 python36 python3-lxml
+        fi
+        if [ ! $? -eq 0 ]; then
+          echo "ERROR: Zypper cannot install Python 2 & 3! Python 2 xml module and Python 3 required to continue."
+        else
+          echo "Python 2, Python 2 xml module and Python 3 updated to the latest version from a system repo"
+          exit 0
+        fi
+      fi
+
+    centos_script: |
+      set -x
+      grep -q "release 6.*" /etc/redhat-release
+      if [ $? -eq 0 ]; then
+        yum --nogpgcheck install -y libselinux-python
+        # Install libselinux-python. It is required for CentOS 6.10
+        if [ ! $? -eq 0 ]; then
+          # Should not happen.
+          cat /etc/redhat-release >&2
+          echo "ERROR: Can not install libselinux-python. Install it manually please."
+        fi
+        echo "libselinux-python update and ready to go"
+      fi
+
+  tasks:
+  #IN-3416 remove repoes if it contains package.mapr.com
+  - name: Execute os_script.sh
+    shell: "{{ os_script_check }}"
+    register: os_family_result
+    ignore_errors: True
+
+  - set_fact: os_family="{{ os_family_result.stdout | default('Unknown') }}"
+
+  - debug: var=os_family
+  #Remove Core/Ecosystem repo if it has package.mapr.com(Redhat)
+  - block:
+    - name: Check if core_repo contains package.mapr.com (Redhat)
+      command: grep -q "{{repo_url_old}}" {{repo_path_redhat}}{{core_repo_file}}
+      register: grep_result
+      ignore_errors: yes
+
+    - name: "Remove MapR core_repo (Redhat)"
+      file: path={{ core_repo_file_redhat }} state=absent
+      when: grep_result.rc == 0
+      ignore_errors: True
+
+    - name: Check if eco_repo contains package.mapr.com (Redhat)
+      command: grep -q "{{repo_url_old}}" {{repo_path_redhat}}{{eco_repo_file}}
+      register: grep_result
+      ignore_errors: yes
+
+    - name: "Remove MapR eco_repo (Redhat)"
+      file: path={{ eco_repo_file_redhat }} state=absent
+      when: grep_result.rc == 0
+      ignore_errors: True
+    when: os_family == 'RedHat'
+
+  #Remove Core/Ecosystem repo if it has package.mapr.com(Debian)
+  - name: "Get list of repo files (Debian)"
+    find:
+      paths: "/etc/apt/sources.list.d"
+      patterns: "*.list"
+    register: repo_files
+    when: os_family == 'Debian'
+
+  - name: "Read content of each repo file (Debian)"
+    command: cat {{ item.path }}
+    register: repo_file_contents
+    with_items: "{{ repo_files.files }}"
+    when: os_family == 'Debian'
+
+  - name: "Remove repositories (Debian)"
+    apt_repository:
+      repo: "{{ item.stdout_lines[0] }}"
+      state: absent
+    with_items: "{{ repo_file_contents.results }}"
+    when: os_family == 'Debian' and repo_url_old in item.stdout
+    ignore_errors: True
+
+  #Remove Core/Ecosystem repo if it has package.mapr.com(SUSE)
+  - block:
+    - name: Check if core_repo contains package.mapr.com (SUSE)
+      command: grep -q "{{repo_url_old}}" {{repo_path_suse}}{{core_repo_file}}
+      register: grep_result
+      ignore_errors: yes
+
+    - name: Remove MapR core_repo (SUSE)
+      file: path={{repo_path_suse}}{{core_repo_file}} state=absent
+      when: grep_result.rc == 0
+      ignore_errors: True
+
+    - name: Check if eco_repo contains package.mapr.com (SUSE)
+      command: grep -q "{{repo_url_old}}" {{repo_path_suse}}{{eco_repo_file}}
+      register: grep_result
+      ignore_errors: yes
+
+    - name: Remove MapR eco_repo (SUSE)
+      file: path={{repo_path_suse}}{{eco_repo_file}} state=absent
+      when: grep_result.rc == 0
+      ignore_errors: True
+    when: os_family == 'SUSE'
+
+  # There is an issue on SUSE: without python we cannot check privileges, so only for suse - we run script to detect python first.
+  - name: Check for zypper and try to install python.
+    raw: "{{ suse_script }}"
+    args:
+      executable: /bin/bash
+    register: zypper
+    ignore_errors: True
+
+  - name: Check privileges escalation for non-root user.
+    check_become.py: ssh_id="{{ ssh_id }}" timeout=10
+    ignore_errors: True
+    register: become_check
+
+  - fail: msg="user {{ ssh_id }} does not have the ability to elevate privileges - check for correct sudoers config for example"
+    when: become_check is failed
+
+#  # By default raw module execute command with sh, not bash. Do not change
+#  # executable parameter.
+#  - name: Check sudo privileges for non-root user.
+#    raw: "{{ sudo_check_scipt }}"
+#    args:
+#      executable: /bin/bash
+#    register: sudo_check
+
+  - name: Check for apt and try to install python.
+    raw: "{{ apt_script }}"
+    args:
+      executable: /bin/bash
+    register: apt
+    ignore_errors: True
+
+  - name: Check for yum and try to install python.
+    raw: "{{ rhel_script }}"
+    args:
+      executable: /bin/bash
+    register: yum
+    ignore_errors: True
+
+  - name: Check for libselinux-python.
+    raw: "{{ centos_script }}"
+    args:
+      executable: /bin/bash
+    register: libselinux
+    ignore_errors: True
+
+  - name: Test Python install scripts
+    fail: msg="Access to host denied. Please check login and password/pubkey"
+    when: (apt.rc is defined and apt.rc == 5) or (yum.rc is defined and yum.rc == 5) or
+      (zypper.rc is defined and zypper.rc == 5)
+
+  - name: Collect only facts returned by facter
+    setup:
+      gather_subset:
+        - min
+
+  - name: Test libselinux installaton
+    fail: msg="Python pip require libselinux-python on hosts"
+    when: yum is succeeded and libselinux is failed
+
+- name: Validating prerequisites
+  # We explicitly turn on gather_facts here to get access to the
+  # ansible facts for mapr_prereq.py
+  gather_facts: True
+  hosts: all
+  max_fail_percentage: 80
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+    LANG: "en_US.UTF-8"
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  vars:
+    mysql_socket: ""
+    module_debug: "{{ mapr_debug|default(False) }}"
+    prereq_tarball: "/tmp/installer_prerq_modules.tgz"
+
+  tasks:
+    - name: Ensure mapr_home exist
+      file:
+        path: "{{ mapr_home }}"
+        state: directory
+
+    - name: Adding installation lock file
+      file:
+        path: "{{ mapr_home }}/installer-lock.file"
+        state: touch
+
+    - fail: msg="Timeout {{item}} invalid, must be an integer >= 0. Please check group_vars/all"
+      when: item|int(-1) < 0
+      with_items:
+      - "{{ timeout.standard }}"
+      - "{{ timeout.configure }}"
+
+    - fail: msg='Detected stale mounts (likely NFS, likely /mapr). You might have to restart NFS or reboot the node'
+      when: ansible_mounts is not defined
+
+    - debug: var=shared_mysql_host
+
+    - debug: var=ansible_nodename
+
+    - debug: var=ansible_fqdn
+
+    - shell: echo 'show variables;' | mysql | grep "^socket" | awk '{print $2}'
+      when: shared_mysql_host is defined and shared_mysql_host == ansible_nodename or
+            shared_mysql_host is defined and shared_mysql_host == ansible_fqdn
+      register: mysql_socket_output
+
+    - set_fact: mysql_socket="{{ mysql_socket_output.stdout }}"
+      when: mysql_socket_output is not skipped and mysql_socket_output is success
+
+    # Since tar named in same way in all supported systems - we can try to install it here
+    - name: Install tar
+      ansible.builtin.package:
+        name: tar
+        state: present
+
+    - name: Check if tar exists
+      shell: "tar --help"
+      register: tar_exec
+      ignore_errors: true
+
+    - fail:
+        msg: "tar is not found! Please install it with your package manager"
+      when: tar_exec.rc != 0
+
+    # Create a temporary directory on the nodes to put prereq check files
+    - name: Create temporary directory
+      tempfile:
+        state: directory
+        suffix: "prereq"
+      register: temp_dir
+
+    - file: path="{{ prereq_tarball }}" state=absent
+
+    - local_action: shell tar -C "{{ mapr_home }}/installer/mapr_ansible/playbooks/library/prereq/" -czf "{{ prereq_tarball }}" "."
+      become: false
+      run_once: true
+
+    # Move the prereq check files to the nodes so they can be dynamically loaded by mapr_prereq.py
+    # mapr_prereq.py deletes the temp dir when tests are complete
+    - name: Copy prereq check files
+      unarchive: src="{{ prereq_tarball }}" dest="{{ temp_dir.path }}" copy=yes
+
+    - name: Verify prerequisites
+      mapr_prereq.py:
+        admin_gid='{{ cluster_admin_gid }}'
+        admin_group='{{ cluster_admin_group }}'
+        admin_uid='{{ cluster_admin_uid }}'
+        admin_user='{{ cluster_admin_id }}'
+        cloud_provider='{{ "" if provider is not defined else provider.id }}'
+        core_ver='{{ version }}'
+        cpu='{{ ansible_architecture }}'
+        create_admin='{{ cluster_admin_create }}'
+        data='{{ mapr.node|to_json }}'
+        db_admin_password='{{ "" if db_admin_password is not defined else db_admin_password }}'
+        db_admin_password_set='{{ False if db_admin_password_set is not defined else db_admin_password_set }}'
+        db_admin_user='{{ "" if db_admin_user is not defined else db_admin_user }}'
+        debug='{{ module_debug }}'
+        devices='{{ ansible_devices|to_json }}'
+        disks='{{ mapr.node.disks|join(",") }}'
+        distro='{{ ansible_distribution }}'
+        distro_ver='{{ ansible_distribution_version }}'
+        env_variables='{{ mapr.node.variables|to_json }}'
+        fips='{{ ansible_fips }}'
+        fqdn='{{ ansible_fqdn }}'
+        fresh_install='{{ is_fresh_install }}'
+        home='{{ mapr_home }}'
+        hosts="{{ groups.all }}"
+        interfaces='{{ ansible_interfaces }}'
+        is_cloud='{{ True if provider is defined else False }}'
+        lvm='{{ ansible_lvm|default(omit)|to_json }}'
+        mapr_subnet='{{ "" if mapr_subnet is not defined else mapr_subnet }}'
+        mep_ver='{{ mep_version }}'
+        mounts='{{ ansible_mounts|to_json }}'
+        mysql_host='{{ shared_mysql_host }}'
+        mysql_socket='{{ mysql_socket }}'
+        no_internet='{{ no_internet }}'
+        nodename='{{ ansible_nodename }}'
+        prereq_tests='{{ temp_dir.path }}'
+        prereq_values='{{ prereq_values }}'
+        ram='{{ ansible_memtotal_mb }}'
+        security='{{ security }}'
+        swap='{{ ansible_swaptotal_mb }}'
+        use_external_mysql='{{ use_external_mysql }}'
+        use_shared_mysql='{{ use_shared_mysql }}'

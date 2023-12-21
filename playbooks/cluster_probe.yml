@@ -1,0 +1,219 @@
+---
+#
+# Playbook Name:: cluster_probe
+#
+# Copyright 2017, MapR Technologies
+#
+# Run with
+#    ansible-playbook <playbook>
+# on a local system, or
+#    ansible-playbook <playbook> -e "cloud_user=ec2-user" -e "cloud_connection=ssh"
+# when accessing remote systems (for example in the Amazon cloud)
+#
+- name: MapR Installer Cluster Probe
+  hosts: all
+  gather_facts: yes
+  serial: "{{ forks }}"
+
+  vars:
+    mapr_home: "/opt/mapr"
+    maprConf: "{{ mapr_home }}/conf"
+    cConfFile: "{{ maprConf }}/mapr-clusters.conf"
+    cldbRoleFile: "{{ mapr_home }}/roles/cldb"
+    esRoleFile: "{{ mapr_home }}/roles/elasticsearch"
+    #inst_tmp: "{{ mapr_home }}/installer/data/tmp"
+    inst_tmp: "{{ mapr_home }}/installer/data/tmp"
+    module_debug: "{{ stanza['debug']|default(False) }}"
+    securityOn: False
+    cert_files:
+        - cldb.key
+        - ssl_keystore
+        - ssl_truststore
+    additional_cert_files:
+        - maprserverticket
+        - dare.master.key
+        - ssl_truststore.pem
+        - ssl_truststore.p12
+        - ssl_keystore-signed.pem
+        - ssl_keystore.csr
+        - ssl_keystore.p12
+        - ssl_keystore.pem
+    user_stores_files:
+        - ssl_usertruststore
+        - ssl_usertruststore.pem
+        - ssl_usertruststore.p12
+        - ssl_userkeystore
+        - ssl_userkeystore-signed.pem
+        - ssl_userkeystore.csr
+        - ssl_userkeystore.p12
+        - ssl_userkeystore.pem
+    ssl_server_files:
+        - ssl-client.xml
+        - ssl-server.xml
+    ca_cert_files:
+        - ca/chain-ca.pem
+        - ca/root-ca.pem
+        - ca/signing-ca.pem
+    es_sg_conf_files:
+        - sg_http_
+        - sg_ssl_
+    es_sg_srvr_files:
+        - keystore.jks
+        - signed.pem
+    es_cert_files:
+        - admin-usr-clientCombo.pem
+        - admin-usr-keystore.jks
+        - admin-usr-private-key.pem
+        - admin-usr-signed.pem
+        - fluentd-usr-clientCombo.pem
+        - fluentd-usr-private-key.pem
+        - fluentd-usr-signed.pem
+        - kibanaserver-usr-clientCombo.pem
+        - kibanaserver-usr-private-key.pem
+        - kibanaserver-usr-signed.pem
+        - sg2.yml
+        - truststore.jks
+    fips_credentials:
+        - maprkeycreds.conf
+        - maprkeycreds.bcfks
+        - maprtrustcreds.conf
+        - maprtrustcreds.bcfks
+        - maprkeycreds.jceks
+        - maprtrustcreds.jceks
+        - ssl_keystore.bcfks
+        - ssl_keystore.bcfks.csr
+        - ssl_truststore.bcfks
+        - ssl_userkeystore.bcfks
+        - ssl_userkeystore.bcfks.csr
+        - ssl_usertruststore.bcfks
+  environment:
+    MAPR_TICKETFILE_LOCATION: "{{mapr_home}}/conf/mapruserticket"
+
+  tasks:
+
+  - name:  Determine if cluster is configured
+    stat: path="{{ cConfFile }}"
+    register: cluster_conf
+    check_mode: False
+
+  - name:  Determine CLDB role
+    stat: path="{{ cldbRoleFile }}"
+    register: cldb_role
+
+  - name:  Determine Elasticsearch role
+    stat: path="{{ esRoleFile }}"
+    register: es_role
+
+  - block:
+    - shell: "ls -1d {{ mapr_home }}/elasticsearch/elasticsearch-* | cut -d'-' -f2"
+      register: es_version
+
+    - debug: var=es_version
+
+    - set_fact: esSgPath="{{ mapr_home }}/elasticsearch/elasticsearch-{{ es_version.stdout }}/etc/elasticsearch/sg"
+
+    - stat: path="{{ esSgPath }}/ca/es-root-ca.pem"
+      register: es_ca_file
+    when: es_role.stat.exists
+
+  - name:  Security state
+    shell: "head -1 {{ cConfFile }} | grep -o 'secure=\\w*' | cut -d= -f2"
+    register: secure_status
+
+  - block:
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=no validate_checksum=no
+      with_items: "{{ cert_files }}"
+    # some of these do not exist for all releases so ignore failure if one does not
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=no validate_checksum=no
+      with_items: "{{ additional_cert_files }}"
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=no validate_checksum=no
+      with_items: "{{ user_stores_files }}"
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=no validate_checksum=no
+      with_items: "{{ ssl_server_files }}"
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=no validate_checksum=no
+      with_items: "{{ fips_credentials }}"
+    - fetch: src='{{ maprConf }}/ca/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=no validate_checksum=no
+      with_items: "{{ ca_cert_files }}"
+    when: cluster_conf.stat.exists and 'true' in secure_status.stdout and cldb_role.stat.exists
+
+  - block:
+    - fetch: src='{{ esSgPath }}/ca/es-root-ca.pem' dest='{{inst_tmp}}/es-root-ca.pem' flat=yes fail_on_missing=yes validate_checksum=no
+    # some files are not there depending on release so ignore failures
+    - fetch: src='{{ esSgPath }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=no validate_checksum=no
+      with_items:
+        - "{{ es_cert_files }}"
+
+    - block:
+      - find: paths='{{ esSgPath }}' patterns="{{ item }}.*yml$" use_regex=True
+        register: es_sg_conf_files_found
+        with_items:
+          - "{{ es_sg_conf_files }}"
+
+      - fetch: src='{{ item.1.path }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+        with_subelements:
+          - "{{ es_sg_conf_files_found.results }}"
+          - "files"
+        when: es_sg_conf_files_found is succeeded
+
+    - fetch: src='{{ esSgPath }}/../.keystore_password' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+
+    - block:
+      - find: paths='{{ esSgPath }}' patterns=".*-srvr-{{ item }}$" use_regex=True
+        register: es_sg_srvr_files_found
+        with_items:
+          - "{{ es_sg_srvr_files }}"
+
+      - fetch: src='{{ item.1.path }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+        with_subelements:
+          - "{{ es_sg_srvr_files_found.results }}"
+          - "files"
+        when: es_sg_srvr_files_found is succeeded
+    when: cluster_conf.stat.exists and 'true' in secure_status.stdout and es_role.stat.exists and es_ca_file.stat.exists
+
+  - find: paths='{{inst_tmp}}/' file_type='file'
+    register: inst_tmp_files
+  
+  - name: Change ownership of files on '{{inst_tmp}}' to '{{ stanza.config.cluster_admin_id }}'
+    file: path='{{ item.path }}' state=file owner='{{ stanza.config.cluster_admin_id }}' group='{{ stanza.config.cluster_admin_group }}' mode='u+rw'
+    with_items: "{{ inst_tmp_files.files }}"
+
+  - name: Cluster Inventory Probe
+    cluster_inventory_probe:
+      cluster_admin_id='{{ stanza.config.cluster_admin_id }}'
+      debug='{{ module_debug }}'
+    check_mode: no
+
+  # Create a temporary directory on the nodes to put prereq check files
+  - name: Create temporary directory
+    tempfile:
+      state: directory
+      suffix: "prereq"
+    register: temp_dir
+
+  # Move the prereq check files to the nodes so they cabn be dynamically loaded by mapr_prereq.py
+  # mapr_prereq.py deletes the temp dir when tests are complete
+  - name: Copy prereq check files
+    copy:
+      src: "{{ mapr_home }}/installer/mapr_ansible/playbooks/library/prereq/"
+      dest: "{{ temp_dir.path }}"
+  - name: Prereq Probe
+    check_mode: no
+    mapr_prereq.py:
+      cluster_probe=True
+      core_ver='{{ci_core_ver}}'
+      cpu='{{ ansible_architecture }}'
+      debug='{{ module_debug }}'
+      devices='{{ansible_devices|to_json}}'
+      disks='{{ci_disks|join(",")}}'
+      distro={{ ansible_distribution }}
+      distro_ver={{ ansible_distribution_version }}
+      fqdn={{ansible_fqdn}}
+      hosts='{{ groups.all }}'
+      ignore_errors={{ true }}
+      mounts='{{ ansible_mounts|to_json}}'
+      prereq_tests='{{ temp_dir.path }}'
+      prereq_values='{{ prereq_values }}'
+      ram={{ansible_memtotal_mb}}
+      swap={{ansible_swaptotal_mb}}
+      db_admin_password_set='{{ False if db_admin_password_set is not defined else db_admin_password_set }}'
+    when: ci_disks

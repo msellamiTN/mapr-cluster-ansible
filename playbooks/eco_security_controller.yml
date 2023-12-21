@@ -1,0 +1,203 @@
+---
+#
+# Playbook Name:: Eco Master node configuration
+#
+# Copyright 2017, MapR Technologies
+
+- name: Configuring MapR Ecosystem Security Manager
+  hosts: all
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+    MAPR_TICKETFILE_LOCATION: "{{mapr_home}}/conf/mapruserticket"
+
+  vars:
+    maprConf: "{{ mapr_home }}/conf"
+    cConfFile: "{{ maprConf }}/mapr-clusters.conf"
+    inst_tmp: "{{ mapr_home }}/installer/data/tmp"
+    security: "{{ mapr.node.security|default('disabled') }}"
+    esSecurity: "{{ mapr.node.es_security|default('disabled') }}"
+    esNodes: "{{ mapr.groups.es }}"
+    es_fqdn_nodes: []
+    es_name_resolution_failure: False
+    es_sg_conf_files:
+        - sg_http_
+        - sg_ssl_
+    es_sg_srvr_files:
+        - keystore.jks
+        - signed.pem
+    es_sg_srvr_600_files:
+        - admin-usr-keystore.jks
+        - truststore.jks
+        - sg2.yml
+    es_sg_srvr_601_files:
+        - admin-usr-clientCombo.pem
+    es_sg_srvr_610_files:
+        - admin-usr-signed.pem
+        - admin-usr-private-key.pem
+        - fluentd-usr-clientCombo.pem
+        - fluentd-usr-signed.pem
+        - fluentd-usr-private-key.pem
+        - kibanaserver-usr-clientCombo.pem
+        - kibanaserver-usr-signed.pem
+        - kibanaserver-usr-private-key.pem
+    diskEncryption: "{% if enable_encryption_at_rest|default(False) %}1{% else %}0{% endif %}"
+    meteringMinConfig: "{% if enable_min_metrics_collection|default(False) %}1{% else %}0{% endif %}"
+
+  tasks:
+  - name: Determine MapR version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'"
+    check_mode: False
+    register: mapr_version_triple
+
+  - debug: var=esSecurity
+
+  - debug: var=mapr_version_triple
+
+  - shell: "ls -1d {{ mapr_home }}/elasticsearch/elasticsearch-* | cut -d'-' -f2"
+    register: es_version
+
+  - debug: var=es_version
+
+  - set_fact: esEtcEsPath="{{ mapr_home }}/elasticsearch/elasticsearch-{{ es_version.stdout }}/etc/elasticsearch"
+  - set_fact: esSgPath="{{ esEtcEsPath }}/sg"
+
+  - block:
+    - set_fact: es_cert_files="{{ es_sg_srvr_600_files }}"
+      when: mapr_version_triple.stdout | int >= 600
+
+    - set_fact: es_cert_files="{{ es_cert_files }} + {{ es_sg_srvr_601_files }}"
+      when: mapr_version_triple.stdout | int >= 601
+
+    - set_fact: es_cert_files="{{ es_cert_files }} + {{ es_sg_srvr_610_files }}"
+      when: mapr_version_triple.stdout | int >= 610
+
+    - name: "remove .keystore_password so we can regenerate keys on upgrade"
+      file: path="{{ esEtcEsPath }}/.keystore_password" state=absent
+      when: command is defined and (command == "upgrade" or command == "rolling_upgrade") and mapr_version_triple.stdout | int == 601
+
+    - name: "force SG to reaload config"
+      file: path="{{ esEtcEsPath }}/.force_sg_load" state=touch
+      when: command is defined and (command == "upgrade" or command == "rolling_upgrade") and esSecurity == 'master'
+
+    - stat: path="{{ cConfFile }}"
+      register: cluster_conf
+      check_mode: False
+
+    - name: Executing do_configure.sh from 'eco_security_controller.yml'
+      do_configure.sh: MAPR_HOME={{ mapr_home }}
+          MAPR_USER={{ cluster_admin_id }}
+          MAPR_GROUP={{ cluster_admin_group }}
+          CLUSTERNAME={{ cluster_name }}
+          CLDBNODES={{ mapr.groups.cldb|join(',') }}
+          ZKNODES={{ mapr.groups.zk|join(',') }}
+          HISTORYSERVER_HOST={{ HISTORYSERVER_HOST|default('') }}
+          TIMELINESERVER_HOST={{ TIMELINESERVER_HOST|default('') }}
+          HMNODES={{ HIVEMETASTORE_HOSTS|default('') }}
+          ESNODES={{ ELASTICSEARCH_HOSTS|default('') }}
+          ES_DB={{ elasticsearch_path|default('') }}
+          ES_PW={{ log_admin_password|default('') }}
+          NORECALC="{% if patch_file is defined and patch_file|length > 0 %}1{% else %}0{% endif %}"
+          GRAFANA_PW="{% if security == 'disabled' %}{{ metrics_ui_admin_password|default('') }}{% else %}{{ cluster_admin_password }}{% endif %}"
+          OTNODES={{ OPENTSDB_HOSTS|default('') }}
+          DARE={{ diskEncryption }}
+          METERING_CONFIG_ONLY={{ meteringMinConfig }}
+          SECURITY={{ security }}
+          ES_SECURITY={{ esSecurity }}
+          YARN={{ True }}
+          LICENSE_MODULES={{ license_modules|join(',') }}
+          LICENSE_TYPE={{ license_type }}
+          FRESH_INSTALL={{ 0 if cluster_conf.stat.exists|bool == True else 1}}
+          REFRESH_ROLES=1
+      register: do_es_security_controller_configure_result
+      ignore_errors: True
+
+    - set_fact: configure_log="{{ do_es_security_controller_configure_result.mapr_logs | regex_search(cfg_log_regexp,'\\3') }}"
+      when: do_es_security_controller_configure_result.mapr_logs is defined
+
+    - debug: var=do_es_security_controller_configure.result.mapr_logs
+    - debug: var=configure_log
+
+    - fetch: src='{{ configure_log[0] }}' dest='{{log_dir}}/{{ ansible_nodename }}_{{ configure_log[0].split('/')[-1] }}' flat=yes validate_checksum=no
+      when: configure_log
+      register: configure_log_fetched
+
+    - file: path="{{ configure_log[0] }}" state=absent
+      when: configure_log_fetched is succeeded and configure_log_fetched is not skipped
+
+
+      # expand ip addresses
+    - shell: "getent hosts {{ item }} | awk '{print $2}' | head -n 1"
+      register: es_fqdn_names
+      with_items:
+        - "{{ esNodes }}"
+
+      # ES FQDN list
+    - set_fact:
+        es_fqdn_nodes: "{{ es_fqdn_nodes }} + [ '{{ item.stdout }}' ]"
+      with_items:
+        - "{{ es_fqdn_names.results }}"
+
+    - debug: var=es_fqdn_names
+
+    - debug: var=es_fqdn_nodes
+
+    - set_fact: es_name_resolution_failure=True
+      when: item|trim == ''
+      with_items:
+        - "{{ es_fqdn_nodes }}"
+
+    - debug: "Atleast one of the ES hosts {{ esNodes }} -> {{ es_fqdn_nodes }} has a dns issue"
+      when: es_name_resolution_failure
+
+    - block:
+      - stat: path="{{ esSgPath }}/ca/es-root-ca.pem"
+        register: es_ca_file
+      - stat: path="{{ esSgPath }}/truststore.jks"
+        register: es_truststore_file
+      - stat: path="{{ esSgPath }}/sg2.yml"
+        register: es_sg2_file
+
+      - set_fact: es_keygen_failed="{{True if (es_ca_file.stat.exists|bool == False or
+                                               es_truststore_file.stat.exists|bool == False or
+                                               es_sg2_file.stat.exists|bool == False or
+                                               es_name_resolution_failure) else False}}"
+      - debug: msg="Elasticsearch key generation failed, Please set it up manually"
+        when: es_keygen_failed
+
+      - block:
+          # store ES CA cert
+        - fetch: src='{{ esSgPath }}/ca/es-root-ca.pem' dest='{{inst_tmp}}/es-root-ca.pem' flat=yes fail_on_missing=yes validate_checksum=no
+
+          # name: store ES truststore
+        - fetch: src='{{ esSgPath }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+          with_items:
+            - "{{ es_cert_files }}"
+
+          # name: store ES Configs
+        - fetch: src='{{ esSgPath }}/{{ item.0 }}{{ item.1 }}.yml' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+          with_nested:
+            - "{{ es_sg_conf_files }}"
+            - "{{ es_fqdn_nodes }}"
+
+          # name: store ES server keys
+        - fetch: src='{{ esSgPath }}/{{ item.1 }}-srvr-{{ item.0 }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+          with_nested:
+            - "{{ es_sg_srvr_files }}"
+            - "{{ es_fqdn_nodes }}"
+
+        - fetch: src='{{ esSgPath }}/../.keystore_password' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+
+        when: not es_keygen_failed
+      when: esSecurity == 'master'
+    when: mapr_version_triple.stdout | int < 620
+
+  - name: "force SG to reaload config"
+    file: path="{{ esEtcEsPath }}/.force_sg_load" state=touch
+    when: command is defined and (command == "upgrade" or command == "rolling_upgrade") and mapr_version_triple.stdout | int >= 620 and esSecurity == 'master'
+
+
+  - debug: var=esSecurity
+  - mapr_state.py: state=20

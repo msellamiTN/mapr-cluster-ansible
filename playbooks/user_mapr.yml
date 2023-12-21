@@ -1,0 +1,101 @@
+---
+#
+# Playbook Name:: user_mapr
+#
+# Copyright 2013, MapR Technologies
+#
+
+- name: Creating cluster admin account
+  hosts: all
+  serial: "{{ forks }}"
+  vars:
+      cluster_admin_home: "/home/{{ cluster_admin_id }}"
+
+  tasks:
+    - block:
+      - name: Create admin group
+        action: "maprgroup.sh MAPR_GROUP={{ cluster_admin_group }}
+            MAPR_GID={{ cluster_admin_gid }}"
+        when: cluster_admin_create
+
+      - name: Create admin user
+        action: "mapruser.sh MAPR_USER={{ cluster_admin_id }}
+            MAPR_UID={{ cluster_admin_uid }} MAPR_GROUP={{ cluster_admin_group }}
+            MAPR_SHELL=/bin/bash MAPR_PASSWORD={{ cluster_admin_password }}
+            MAPR_HOME={{ mapr_home }}"
+        when: cluster_admin_create
+
+      # We'd like the user to always source the
+      - shell: "getent passwd {{ cluster_admin_id }} | cut -d: -f6"
+        register: cluster_admin_getent
+        ignore_errors: True
+
+      - set_fact: cluster_admin_home="{{ cluster_admin_getent.stdout }}"
+        when: cluster_admin_getent is succeeded and cluster_admin_getent.stdout
+
+      # ENV settings from the MapR installation (if present)
+      - stat: path="{{ cluster_admin_home }}/.bashrc"
+        register: cluster_admin_id_bashrc
+        check_mode: False
+
+      - name: Update admin shell rc file
+        ansible.builtin.lineinfile:
+            dest="{{ cluster_admin_home }}/.bashrc"
+            create=yes
+            mode=0644
+            regexp=".*/conf/env.sh$"
+            line="[[ -f {{ mapr_home }}/conf/env.sh ]] && . {{ mapr_home }}/conf/env.sh"
+        when: cluster_admin_id_bashrc.stat.exists|bool == True
+
+      - authorized_key:
+            user="{{ cluster_admin_id }}"
+            key="{{ lookup('file', '/opt/mapr/installer/data/installer_key.pub') }}"
+
+      - file:
+            path="{{ cluster_admin_home }}/.ssh" state=directory
+            owner="{{ cluster_admin_id }}"
+            group="{{ cluster_admin_group }}"
+            mode=700
+
+      - copy:
+            src=/opt/mapr/installer/data/installer_key
+            dest="{{ cluster_admin_home }}/.ssh/installer_key"
+            owner="{{ cluster_admin_id }}"
+            group="{{ cluster_admin_group }}"
+            mode=400
+
+      when: is_upgrade|bool == False
+
+    - debug: var=security
+    - debug: var=is_upgrade
+    - debug: var=version
+    - block:
+      - name: create s3 cert directory
+        file:
+          path="{{ cluster_admin_home }}/.mc/certs/CAs/" state=directory
+          owner="{{ cluster_admin_id }}"
+          group="{{ cluster_admin_group }}"
+
+      - stat: path="{{ cluster_admin_home }}/.mc/certs/CAs/chain-ca.pem"
+        register: cluster_admin_id_s3_cas
+
+      - name: create s3 ca cert symlink
+        file:
+          src="{{ mapr_home }}/conf/ca/chain-ca.pem"
+          dest="{{ cluster_admin_home }}/.mc/certs/CAs/chain-ca.pem" state=link
+          force=yes
+          owner="{{ cluster_admin_id }}"
+          group="{{ cluster_admin_group }}"
+        when: cluster_admin_id_s3_cas.stat.exists|bool == False
+
+      when: version is version_compare('7.0.0', '>=') and security
+
+
+    - name: create s3 ca cert symlink
+      file:
+        path="{{ cluster_admin_home }}/.mc/certs/CAs/chain-ca.pem"
+        state=absent
+
+      when: version is version_compare('7.0.0', '>=') and not security
+
+    - mapr_state.py: state=5

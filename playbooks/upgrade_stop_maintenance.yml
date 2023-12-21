@@ -1,0 +1,130 @@
+---
+#
+# Playbook Name:: upgrade_stop_maintenance
+#
+#
+
+- name: Remove node from maintenance
+  hosts: all
+  vars:
+    wait_seconds: 60
+    retry_delay: 5
+    retry_count: 120
+    MAPR_CLI: "sudo -E -n -u {{ cluster_admin_id }} {{ mapr_home }}/bin/maprcli"
+    nfs_activated: "{{ mapr.node.global_nfs_enabled }}"
+    maprConfConfd: "{{ mapr_home }}/conf/conf.d"
+    maprloopbacknfsHome: "/usr/local/mapr-loopbacknfs"
+    loopbacknfsRoleFile: "{{ maprloopbacknfsHome }}/roles/loopbacknfs"
+
+  environment:
+    MAPR_TICKETFILE_LOCATION: "{{mapr_home}}/conf/mapruserticket"
+
+  tasks:
+    - block:
+      - name: "Remove the node from maintenance mode"
+        shell: "{{ MAPR_CLI }} node maintenance -timeoutminutes 0 -nodes {{ ansible_nodename }}"
+        run_once: True
+        ignore_errors: True
+        register: remove_maintenance
+
+      - debug: var=remove_maintenance
+        when: remove_maintenance is failed
+
+      - name: "Notify the CLDB that the upgrade is complete on the node"
+        shell: "{{ MAPR_CLI }} notifyupgrade finish -node {{ ansible_nodename }}"
+        run_once: True
+        ignore_errors: True
+
+      - import_tasks: bounce_warden.yml
+
+      - name: "pause for {{ wait_seconds | int }} second(s)"
+        ansible.builtin.pause:
+          seconds: "{{ wait_seconds | int }}"
+
+      - name: Wait for local containers to resync
+        wait_for_resync.sh:
+          MAPR_HOME: "{{ mapr_home }}"
+          TIMEOUT_MRCONFIG: "{{ timeout.standard | int + 60 }}"
+        register: resync_local_containers
+        retries: "{{ retry_count }}"
+        until: resync_local_containers is not failed
+        ignore_errors: True
+        delay: "{{ retry_delay }}"
+
+      - debug: var=resync_local_containers
+
+      - name: Determine MapR version
+        shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'"
+        check_mode: False
+        register: mapr_version_triple
+
+      - block:
+        - name: "Find any ECOs that we disabled during upgrade"
+          shell: "grep -l 'service.runstate=disabled' {{ maprConfConfd }}/*"
+          register: disabled_ecos
+          ignore_errors: True
+
+        - debug: var=disabled_ecos
+
+        - name: "Reenable disabled ECOs"
+          shell: "{{ MAPR_CLI }} node services -name {{ item|regex_replace('.*warden\\.(.*)\\.conf','\\1') }} -action enable -nodes {{ ansible_nodename }} && sleep 5"
+          ignore_errors: True
+          with_items: "{{ disabled_ecos.stdout_lines }}"
+          when: disabled_ecos is succeeded
+          register: disabled_ecos_enabled
+
+        - name: "workaround intermittent enable issue"
+          ansible.builtin.lineinfile: path={{ item.item }} line='service.runstate=disabled' state=absent
+          with_items: "{{ disabled_ecos_enabled.results }}"
+          when: disabled_ecos_enabled is failed and disabled_ecos_enabled.results is defined
+          register: forced_enable
+
+        - debug: var=forced_enable
+
+        - debug: var=disabled_ecos_enabled
+
+        - name: "Check to see if we have upgraded services that overwrote the warden conffile"
+          shell: "{{ MAPR_CLI }} service list -node {{ ansible_nodename }} -output terse | awk '{if ($1 == 5) { if (NF == 5) { print $5 } else { print $4}}}'"
+          ignore_errors: True
+          when: disabled_ecos is succeeded
+          register: potentially_disabled_services
+
+        - name: "Enable missed ones because of overwritten warden conffiles without disable state"
+          command: "{{ MAPR_CLI }} node services -action enable -name {{ item }} -nodes {{ ansible_nodename }}"
+          with_items: "{{ potentially_disabled_services.stdout_lines }}"
+          ignore_errors: True
+          when: potentially_disabled_services is succeeded and potentially_disabled_services.stdout_lines|length > 0
+          register: enabled_missed_services
+
+        - debug: var=enabled_missed_services
+
+        - debug: msg="WARNING:\ Some ecosystems failed to be enabled, which means an additional restart may be needed after install for those"
+          when: disabled_ecos_enabled is failed
+
+        when: mapr_version_triple.stdout | int >= 610 and command is defined and command == "rolling_upgrade"
+
+      - stat: path="{{ loopbacknfsRoleFile }}"
+        check_mode: False
+        register: loopbacknfs_present
+
+      - name: make sure loopbacknfs is running if warden got bounced
+        service: name=mapr-loopbacknfs enabled=yes state=started
+        when: loopbacknfs_present.stat.exists|bool == True
+
+      - name: "Check /mapr is mounted"
+        shell: df | grep /mapr
+        async: 30
+        poll: 5
+        register: mapr_mounted
+        ignore_errors: True
+
+      - name: Mount /mapr
+        command: "mount -o soft,intr,nolock localhost:/mapr /mapr"
+        retries: "{{ retry_count }}"
+        delay: "{{ retry_delay }}"
+        register: mount_mapr
+        until: mount_mapr is not failed
+        ignore_errors: True
+        when: loopbacknfs_present.stat.exists|bool == True and mapr_mounted.rc == 1
+
+      when: command is defined and command == "rolling_upgrade"

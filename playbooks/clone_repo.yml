@@ -1,0 +1,106 @@
+---
+#
+# Playbook Name:: clone_mapr_repo
+#
+# Copyright 2013, MapR Technologies
+#
+# This playbook enables the cloning of a MapR repository to
+# the local system.   The required variables are
+#    dst_path (target destination)
+# and ONE of
+#     src_repo (name of repo already configured on the node)
+#     src_url (full URL of repository)
+#
+# Run with
+#    ansible-playbook <playbook>  \
+#        -e version=<Version | "ecosystem">  [ -e dst_path <dst> ]
+#
+# dst_path is NOT required; the default location will be under the
+# Apache Service configured by this playbook.
+#
+# Examples
+#    1. MapR Core repo (to default apache location)
+#        ansible-playbook <pb>  \
+#            -e version=3.1.0 \
+#
+#    2. MapR Ecosystem repo (to other defined location)
+#        ansible-playbook <pb>  \
+#            -e version=ecosystem \
+#            -e dst_path=/var/local/mapr/ecosystem
+#
+#
+# The repos.yml playbook is designed to handle the HTTP targets created
+# by this script.  It's simple for YUM, and more complex for APT.
+# When specifying the repo_url's for the actual installation, select
+# the top level only
+#   http://<host>/mapr/v<version>   # for the core; NOTE the 'v' prefix !!!
+#   http://<host>/mapr/ecosystem    # for the ecosystem
+#
+
+#
+
+
+- name: Detecting operating system
+  hosts: all
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  tasks:
+
+  - name: Group by packager
+    group_by: key={{ ansible_pkg_mgr }}
+
+  - debug: msg="Cloning MapR {{ version }} repository to
+           {{ dst_path|default('<http_dir>/mapr') }}"
+
+
+- name: Cloning MapR Yum repository
+  hosts: yum
+  gather_facts: False
+
+  tasks:
+  - name: Installing utilities to clone repository.
+    yum:
+      name: curl,yum-utils,createrepo,httpd
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    register: yum_curl_utils
+    until: yum_curl_utils is succeeded
+    delay: "{{ package_manager_delay_sec }}"
+        # Call the library/clone_mapr_repository.sh wrapper script
+        # DO NOT default version variable ... fail if it's not set
+  - action: "clone_mapr_repository.sh REPO_URL={{ repo_core_url }}
+        REPO_ARG={{ version }} LOCAL_REPO_PATH={{ dst_path|default('') }}"
+    register: clone_success
+
+  - debug: msg="{{ clone_success.msg }}"
+    when: clone_success is changed
+
+  - name: Starting httpd
+    service: name=httpd state=restarted enabled=yes
+
+- name: Cloning MapR APT repository
+  hosts: apt
+  gather_facts: False
+
+  tasks:
+  - apt:
+      name: curl,apache2
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: apt_curl_utils
+    until: apt_curl_utils is succeeded
+        # Call the library/clone_mapr_repository.sh wrapper script
+        # DO NOT default version variable ... fail if it's not set
+  - action: "clone_mapr_repository.sh REPO_URL={{ repo_core_url }}
+        REPO_ARG={{ version }} LOCAL_REPO_PATH={{ dst_path|default('') }}"
+    register: clone_success
+
+  - debug: msg="{{ clone_success.msg }}"
+    when: clone_success is changed
+
+  - name: Starting apache2
+    service: name=apache2 state=restarted enabled=yes

@@ -1,0 +1,91 @@
+#!/usr/bin/env python
+
+import boto3
+
+from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.mapr_base import MapRBase
+
+
+class AWSPrepInstaller(MapRBase):
+    def __init__(self, module=None, description="Updates AWS Launch Configuration"):
+        self.module = module
+        self.disk_count = module.params['disk_count']
+        self.disk_size = module.params['disk_size']
+        self.disk_type = module.params['disk_type']
+        self.instance_id = module.params['instance_id']
+        self.availability_zone = module.params['availability_zone']
+        self.aws_region = module.params['aws_region']
+
+    def attach_volumes(self, client):
+        disk_letter = 'f'
+        vols = list()
+        for x in range(0, self.disk_count):
+            if self.disk_type == 'io1':
+                vol = client.create_volume(
+                    AvailabilityZone=self.availability_zone,
+                    VolumeType=self.disk_type,
+                    Iops=self.get_io1_iops(self.disk_size),
+                    Size=self.disk_size
+                )
+            else:
+                vol = client.create_volume(
+                    AvailabilityZone=self.availability_zone,
+                    VolumeType=self.disk_type,
+                    Size=self.disk_size
+                )
+            vols.append(vol['VolumeId'])
+        waiter = client.get_waiter('volume_available')
+        waiter.wait(VolumeIds=vols)
+        devices = list()
+        for vol in vols:
+            device = '/dev/sd' + disk_letter
+            client.attach_volume(
+                Device=device,
+                InstanceId=self.instance_id,
+                VolumeId=vol
+            )
+            devices.append(
+                {
+                    'DeviceName': device,
+                    'Ebs': {
+                        'VolumeId': vol,
+                        'DeleteOnTermination': True
+                    }
+                }
+            )
+            disk_letter = chr(ord(disk_letter) + 1)
+        client.modify_instance_attribute(
+            BlockDeviceMappings=devices,
+            InstanceId=self.instance_id
+        )
+        waiter = client.get_waiter('volume_in_use')
+        waiter.wait(VolumeIds=vols)
+
+    def update(self):
+        client = boto3.client('ec2', region_name=self.aws_region)
+        if self.disk_count > 0:
+            self.attach_volumes(client)
+        self.module.exit_json()
+
+    @staticmethod
+    def get_io1_iops(size):
+        iops = 3 * size
+        if iops < 100:
+            iops = 100
+        if iops > 20000:
+            iops = 2000
+        return str(iops)
+
+
+def main():
+    module = AnsibleModule(
+        argument_spec=dict(
+            aws_region=dict(type='str'),
+            disk_count=dict(type='int'), disk_size=dict(type='int'),
+            disk_type=dict(type='str'), instance_id=dict(type='str'),
+            availability_zone=dict(type='str')))
+    m = AWSPrepInstaller(module)
+    m.update()
+
+
+main()

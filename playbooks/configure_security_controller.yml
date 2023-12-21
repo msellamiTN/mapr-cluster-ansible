@@ -1,0 +1,627 @@
+---
+#
+# Playbook Name:: configure
+#
+# Copyright 2013, MapR Technologies
+#
+#   Very simple implementation.   Calls MapR configure.sh utility
+#   with specifications from the environment.
+#
+
+- name: Configuring security controller
+  hosts: all
+  serial: "{{ forks }}"
+  gather_facts: False
+  any_errors_fatal: True
+
+  environment:
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  vars:
+    maprConf: "{{ mapr_home }}/conf"
+    maprLoginConf: "{{ maprConf }}/mapr.login.conf"
+    newMaprLoginConf: "{{ maprConf }}.new/mapr.login.conf"
+    cConfFile: "{{ maprConf }}/mapr-clusters.conf"
+    envOverrideFile: "{{ maprConf }}/env_override.sh"
+    wConfFile: "{{ maprConf }}/warden.conf"
+    cldbKeyFile: "{{ maprConf }}/cldb.key"
+    dareKeyFile: "{{ maprConf }}/dare.master.key"
+    hsmConfFile: "{{ maprConf }}/maprhsm.conf"
+    diskEncryption: "{% if enable_encryption_at_rest|default(False) %}1{% else %}0{% endif %}"
+    meteringMinConfig: "{% if enable_min_metrics_collection|default(False) %}1{% else %}0{% endif %}"
+    externalPattern: "(^.*)({{ ansible_nodename }}):((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))($|,.*$)"
+    inst_tmp: "{{ mapr_home }}/installer/data/tmp"
+    isUpdate: "{{ is_update | default(false) }}"
+    missing_keys: False
+    maprSslTrustStoreP12: "{{ maprConf }}/ssl_truststore.p12"
+    maprSslTrustStorePem: "{{ maprConf }}/ssl_truststore.pem"
+    security: "{{ mapr.node.security|default('disabled') }}"
+    tokensDirectory: "{{ maprConf }}/tokens"
+    tokensTarBall: "tokens.tgz"
+    key_generated: False
+    configureSSOKeycloak: "{% if sso_keycloak|default(False) %}1{% else %}0{% endif %}"
+    pre_601_ssl_files:
+        - ssl_keystore
+        - ssl_truststore
+    cert_files:
+        - maprserverticket
+        - cldb.key
+    post_601_ssl_files:
+        - ssl_truststore.p12
+        - ssl_truststore.pem
+    post_610_ssl_files:
+        - ssl_keystore.p12
+        - ssl_keystore.pem
+    post_620_ssl_files_not_on_upgrade:
+        - ssl_keystore-signed.pem
+    post_620_ssl_files:
+        - ssl_keystore.csr
+        - ssl_userkeystore
+        - ssl_userkeystore-signed.pem
+        - ssl_userkeystore.csr
+        - ssl_userkeystore.p12
+        - ssl_userkeystore.pem
+        - ssl_usertruststore
+        - ssl_usertruststore.p12
+        - ssl_usertruststore.pem
+    post_620_ca_files:
+        - ca/root-ca.pem
+        - ca/chain-ca.pem
+        - ca/signing-ca.pem
+        - ssl-client.xml
+        - ssl-server.xml
+    dare_cert_files:
+        - dare.master.key
+    fips_ssl_files:
+        - ssl_keystore.p12
+        - ssl_keystore.pem
+        - ssl_keystore.bcfks
+        - ssl_keystore.bcfks.csr
+        - ssl_keystore-signed.pem
+        - ssl_truststore.p12
+        - ssl_truststore.pem
+        - ssl_truststore.bcfks
+        - ssl_userkeystore.p12
+        - ssl_userkeystore.pem
+        - ssl_userkeystore.bcfks
+        - ssl_userkeystore.bcfks.csr
+        - ssl_userkeystore-signed.pem
+        - ssl_usertruststore.p12
+        - ssl_usertruststore.pem
+        - ssl_usertruststore.bcfks
+    post_700_cert_files:
+        - maprserverticket
+    post_700_s3_credentials:
+        - private.key
+        - public.crt
+    post_700_hadoop_credentials:
+        - maprkeycreds.conf
+        - maprkeycreds.jceks
+        - maprtrustcreds.conf
+        - maprtrustcreds.jceks
+    fips_post_700_hadoop_credentials:
+        - maprkeycreds.conf
+        - maprkeycreds.bcfks
+        - maprtrustcreds.conf
+        - maprtrustcreds.bcfks
+    cldbNodes: "{{ mapr.groups.cldb }}"
+    zkNodes: "{{ mapr.groups.zk }}"
+    numExistingCldbs: 0
+    numExistingZks: 0
+    controlGroupChanged: False
+
+  tasks:
+  - name: Get MapR version
+    set_fact:
+      mapr_version_triple: "{{ version | replace('.', '') }}"
+
+  - debug: var=retry
+  - debug: var=configureSSOKeycloak
+
+  - set_fact: ssl_files="{{ pre_601_ssl_files }}"
+    when: ansible_fips|bool == False
+
+  - set_fact: ssl_files="{{ ssl_files }} + {{ post_601_ssl_files }}"
+    when: mapr_version_triple| int >= 601 and ansible_fips|bool == False
+
+  - set_fact: ssl_files="{{ ssl_files }} + {{ post_610_ssl_files }}"
+    when: mapr_version_triple | int >= 610 and ansible_fips|bool == False
+
+  - set_fact: ssl_files="{{ ssl_files }} + {{ post_620_ca_files }} + {{ post_620_ssl_files }}"
+    when: mapr_version_triple | int >= 620 and ansible_fips|bool == False
+
+  - set_fact: ssl_files="{{ ssl_files }} + {{ post_620_ssl_files_not_on_upgrade }}"
+    when: mapr_version_triple | int >= 620 and is_fresh_install and ansible_fips|bool == False
+
+  - block:
+    - set_fact: cert_files="{{ ssl_files }} + {{ cert_files }}"
+
+    - set_fact: cert_files="{{ dare_cert_files }} + {{ cert_files }}"
+      when: diskEncryption|int == 1
+    when: mapr_version_triple | int < 700
+
+#  fix this once core generates the tokens
+  - set_fact: cert_files="{{ ssl_files }} + {{ post_700_cert_files }}"
+    when: mapr_version_triple | int >= 700 and ansible_fips|bool == False
+
+  - set_fact: cert_files="{{ fips_ssl_files }} + {{  post_620_ca_files }} + {{ post_700_cert_files }}"
+    when: mapr_version_triple | int >= 700 and ansible_fips|bool == True
+
+  - name: Check if mapr-clusters.conf exists
+    stat: path="{{ cConfFile }}"
+    register: cluster_conf
+    check_mode: False
+
+  - name: Check if warden.conf exists
+    stat: path="{{ wConfFile }}"
+    register: warden_conf
+    check_mode: False
+
+  - name: get 4 digit version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3$4}'"
+    register: mapr_build_version
+
+  - set_fact: mapr_version_quadruple={{ mapr_build_version.stdout }}
+
+  - name: Get Hadoop version
+    command: "cat {{ mapr_home }}/hadoop/hadoopversion"
+    register: hadoop_version
+
+  - name: Remember number of configured ZKs - configure_security_controller
+    set_fact:
+      numZks: "{{ zkNodes|length }}"
+
+  - name: Remember number of configured CLDBs - configure_security_controller
+    set_fact:
+      numCldbs: "{{ cldbNodes|length }}"
+
+  - shell: "head -1 {{ cConfFile }} | grep -o 'secure=\\w*' | cut -d= -f2"
+    ignore_errors: True
+    register: secure_status
+    when: cluster_conf.stat.exists
+
+  - name: Check if env_override.sh exists
+    stat: path="{{ envOverrideFile }}"
+    register: env_override_file
+    check_mode: False
+
+  - name: Add MAPR_SUBNETS to env_override.sh
+    ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_SUBNETS=' line="export MAPR_SUBNETS={{ mapr_subnet }}"
+    when: mapr_subnet is defined
+
+  - name: Remove MAPR_SUBNETS from env_override.sh
+    ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_SUBNETS=' line=""
+    when: mapr_subnet is not defined and env_override_file.stat.exists
+
+  - name: Add MAPR_RDMA_SUPPORT to env_override.sh
+    ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_RDMA_SUPPORT=' line="export MAPR_RDMA_SUPPORT=false"
+    when: mapr_version_quadruple|int >= 6200 and mapr_version_quadruple|int < 6202
+
+  - name: Remove MAPR_RDMA_SUPPORT from env_override.sh
+    ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_RDMA_SUPPORT=' line=""
+    when: (mapr_version_quadruple|int < 6200 or mapr_version_quadruple|int >= 6202)and env_override_file.stat.exists
+
+  - debug: var=externalPattern
+
+  - debug: var=mapr_external
+    when: mapr_external is defined
+
+  - name: Find my MAPR_EXTERNAL address
+    set_fact: my_mapr_external="{{ mapr_external | regex_replace(externalPattern,'\\3') }}"
+    when: mapr_external is defined
+
+  - debug: var=my_mapr_external
+
+  - name: Add MAPR_EXTERNAL to env_override.sh
+    ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_EXTERNAL=' line="export MAPR_EXTERNAL={{ my_mapr_external }}"
+    when: mapr_external is defined and my_mapr_external is defined and my_mapr_external != mapr_external
+
+  - name: Remove MAPR_EXTERNAL from env_override.sh
+    ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_EXTERNAL=' line=""
+    when: mapr_external is not defined and env_override_file.stat.exists
+
+  #- set_fact: isAlreadySecured=True
+  #  when: cluster_conf.stat.exists and 'true' in secure_status.stdout
+
+  - stat: path="{{ cldbKeyFile }}"
+    register: cldb_key_file
+    check_mode: False
+
+  - stat: path="{{ tokensDirectory }}"
+    register: tokens_directory
+    check_mode: False
+
+  - set_fact: key_generated=True
+    when: cldb_key_file.stat.exists or tokens_directory.stat.exists
+
+  - block:
+    - name: compute number of existing ZKs - configure_security_controller
+      shell: "fgrep zookeeper {{ wConfFile }} | cut -d= -f2 | tr ',' '\n' | wc -l"
+      register: existingZks
+
+    - set_fact: numExistingZks="{{ existingZks.stdout }}"
+
+    - name: figure out if this node already had ZK configured - configure_security_controller
+      shell: "fgrep zookeeper {{ wConfFile }} | fgrep {{ ansible_nodename }}"
+      ignore_errors: True
+      register: existingZkOnMyNode
+
+    when:  warden_conf.stat.exists
+
+  - block:
+      - name: compute number of existing CLDBs - configure_security_controller
+        shell: "cat {{ cConfFile }} | head -n 1 | cut --complement -d' ' -f1 |
+             sed -e 's/[a-zA-Z]*=[a-zA-Z]* //g;s/[a-zA-Z]*=[0-9]* //g' |
+             tr ' ' '\n' | wc -l"
+        register: existingCldbs
+
+      - set_fact: numExistingCldbs="{{ existingCldbs.stdout }}"
+
+      - name: figure out if this node already had CLDB configured - configure_security_controller
+        shell: "cat {{ cConfFile }} | head -n 1 | grep {{ ansible_nodename }}"
+        ignore_errors: True
+        register: existingCldbOnMyNode
+
+    when: cluster_conf.stat.exists
+
+  - name: Determine if controlGroup changed - configure_security_controller
+    set_fact:
+      controlGroupChanged: True
+    when: cluster_conf.stat.exists and (numExistingCldbs != numCldbs or numExistingZks != numZks) or
+          (scaled_dict is defined and scaled_dict['control'])
+
+  - shell: "cp {{ cConfFile }} {{ cConfFile }}.recovery"
+    check_mode: False
+    when: changingSecuritySetting
+
+  - block:
+    - name: Save off mapr.login.conf
+      command: "cp -p {{ maprLoginConf }} {{ maprLoginConf }}.sv.{{ ansible_date_time.epoch }}"
+
+    - name: Install mapr.login.conf
+      command: "cp -p {{ newMaprLoginConf }} {{ maprLoginConf }}"
+
+    when: ((mapr_version_triple | int == 620) or (mapr_version_triple | int == 620)) and (command == "upgrade" or command == "rolling_upgrade")
+
+  - name: "Running configure.sh from 'configure_security_controller.yml'"
+    do_configure.sh: MAPR_HOME={{ mapr_home }}
+        MAPR_USER={{ cluster_admin_id }}
+        MAPR_GROUP={{ cluster_admin_group }}
+        CLUSTERNAME={{ cluster_name }}
+        CLDBNODES={{ mapr.groups.cldb|join(',') }}
+        ZKNODES={{ mapr.groups.zk|join(',') }}
+        HISTORYSERVER_HOST={{ HISTORYSERVER_HOST|default('') }}
+        TIMELINESERVER_HOST={{ TIMELINESERVER_HOST|default('') }}
+        HMNODES={{ HIVEMETASTORE_HOSTS|default('') }}
+        ESNODES={{ ELASTICSEARCH_HOSTS|default('') }}
+        ES_DB={{ elasticsearch_path|default('') }}
+        ES_PW={{ log_admin_password|default('') }}
+        NORECALC="{% if patch_file is defined and patch_file|length > 0 %}1{% else %}0{% endif %}"
+        GRAFANA_PW="{% if security == 'disabled' %}{{ metrics_ui_admin_password|default('') }}{% else %}{{ cluster_admin_password }}{% endif %}"
+        OTNODES={{ OPENTSDB_HOSTS|default('') }}
+        DARE={{ diskEncryption }}
+        METERING_CONFIG_ONLY={{ meteringMinConfig }}
+        SECURITY={{ security }}
+        YARN={{ True }}
+        CONTROL_GROUP_CHANGED="{% if controlGroupChanged %}1{% else %}0{% endif %}"
+        SSO_KEYCLOAK={{ configureSSOKeycloak }}
+        LICENSE_MODULES={{ license_modules|join(',') }}
+        LICENSE_TYPE={{ license_type }}
+        FRESH_INSTALL={{ 0 if cluster_conf.stat.exists else 1}}
+        TIMEOUT_CONFIGURE={{timeout.configure}}
+        TIMEOUT_MAPRCLI={{timeout.standard}}
+    register: do_configure_result
+    ignore_errors: True
+    when: (( cluster_conf.stat.exists|bool == False or key_generated == False ) and
+          security == 'master')
+
+  - set_fact: configure_log="{{ do_configure_result.mapr_logs | regex_search(cfg_log_regexp,'\\3') }}"
+    when: do_configure_result.mapr_logs is defined and do_configure_result is not skipped
+
+  - debug: var=do_configure_result.mapr_logs
+  - debug: var=configure_log
+
+  - fetch: src='{{ configure_log[0] }}' dest='{{log_dir}}/{{ ansible_nodename }}_{{ configure_log[0].split('/')[-1] }}' flat=yes validate_checksum=no
+    when: do_configure_result.mapr_logs is defined and do_configure_result is not skipped and
+          configure_log is defined and configure_log|length > 0
+    register: configure_log_fetched
+
+  - file: path="{{ configure_log[0] }}" state=absent
+    when: configure_log_fetched is succeeded and configure_log_fetched is not skipped
+
+  # If this fails, always remove the clusters.conf,
+  # keystores, cldbkey and serverticket files
+  # to that subsequent executions of the playbook will
+  # have a chance at running properly.
+  - block:
+    - stat: path="{{ cConfFile }}.recovery"
+      register: cluster_conf_recovery
+
+    - command: "cp {{ cConfFile }}.recovery {{ cConfFile }}"
+      when:  cluster_conf_recovery.stat.exists and not is_fresh_install
+
+    - file: name="{{ cConfFile }}" state=absent
+      when: is_fresh_install
+
+    - file: name="{{ maprConf }}/{{ item }}" state=absent
+      with_items:
+        - maprserverticket
+        - mapruserticket
+        - cldb.key
+        - dare.key
+        - ca
+        - tokens
+        - root-ca.conf
+        - signing-ca.conf
+        - ssl_keystore
+        - ssl_keystore-signed.pem
+        - ssl_keystore.csr
+        - ssl_keystore.bcfks
+        - ssl_keystore.bcfks.csr
+        - ssl_keystore.p12
+        - ssl_keystore.pem
+        - ssl_truststore
+        - ssl_truststore.bcfks
+        - ssl_truststore.p12
+        - ssl_truststore.pem
+        - ssl_userkeystore
+        - ssl_userkeystore.bcfks
+        - ssl_userkeystore-signed.pem
+        - ssl_userkeystore.csr
+        - ssl_userkeystore.bcfks.csr
+        - ssl_userkeystore.p12
+        - ssl_userkeystore.pem
+        - ssl_usertruststore
+        - ssl_usertruststore.bcfks
+        - ssl_usertruststore.p12
+        - ssl_usertruststore.pem
+        - maprkeycreds.conf
+        - maprkeycreds.jceks
+        - maprkeycreds.bcfks
+        - maprtrustcreds.conf
+        - maprtrustcreds.jceks
+        - maprtrustcreds.bckfs
+
+    - file: name="{{ dareKeyFile }}" state=absent
+      when: diskEncryption|int == 1
+
+    - file: name="/tmp/maprticket_*" state=absent
+
+    - fail: msg="{{ do_configure_result.msg }} from 'configure_security_controller.yml'; check
+          {{ mapr_home }}/logs/configure.log"
+
+    when: do_configure_result is failed
+
+  - block:
+    - name: Check if ssl-server.xml exists
+      stat: path="{{ maprConf }}/ssl-server.xml"
+      register: sslserverxml
+
+    - name: Check if ssl-client.xml exists
+      stat: path="{{ maprConf }}/ssl-client.xml"
+      register: sslclientxml
+
+    # These are needed during upgrade so we can run manageSSLKeys, configure.sh now creates the links, but we need to generate p12 files so configure.sh 
+    # doesn't complain
+    - name: temporarily create symlink for ssl-server.xml
+      file: src="{{ mapr_home }}/hadoop/hadoop-{{ hadoop_version.stdout }}/etc/hadoop/ssl-server.xml" dest="{{ maprConf }}/ssl-server.xml" state=link
+      when: sslserverxml.stat.exists|bool == False
+      register: created_ssl_server_xml
+
+    - name: temporarily create symlink for ssl-client.xml
+      file: src="{{ mapr_home }}/hadoop/hadoop-{{ hadoop_version.stdout }}/etc/hadoop/ssl-client.xml" dest="{{ maprConf }}/ssl-client.xml" state=link
+      when: sslclientxml.stat.exists|bool == False
+      register: created_ssl_client_xml
+
+    when: cluster_conf.stat.exists|bool == True and is_upgrade|bool == True and
+          mapr_version_triple | int >= 620
+
+  - name: Check if truststore.pem file exist
+    stat: path="{{ maprConf }}/ssl_truststore.pem"
+    register: truststore_pem
+    check_mode: False
+
+  - name: Generate truststore.pem file on upgrade
+    command: "{{ mapr_home }}/server/manageSSLKeys.sh convert -N {{ cluster_name }} {{ mapr_home }}/conf/ssl_truststore {{ mapr_home }}/conf/ssl_truststore.pem"
+    when: is_upgrade | bool == True and mapr_version_triple | int >= 601 and
+          truststore_pem.stat.exists|bool == False and security == 'master'
+
+  - name: Check if keystore.p12 file exist
+    stat: path="{{ maprConf }}/ssl_keystore.p12"
+    register: keystore_p12
+    check_mode: False
+
+  - name: Generate keystore.p12 file on upgrade
+    command: "{{ mapr_home }}/server/manageSSLKeys.sh convert -k -N {{ cluster_name }} {{ mapr_home }}/conf/ssl_keystore {{ mapr_home }}/conf/ssl_keystore.pem"
+    when: mapr_version_triple | int >= 610 and
+          keystore_p12.stat.exists|bool == False and security == 'master' and ansible_fips|bool == False
+
+  - name: Check if user keystore file exist
+    stat: path="{{ maprConf }}/ssl_userkeystore"
+    register: userkeystore
+    check_mode: False
+
+  - block:
+    - name: Generate user keystores on upgrade
+      command: "{{ mapr_home }}/server/manageSSLKeys.sh createusercerts -ug {{cluster_admin_id }}:{{ cluster_admin_group }} -N {{ cluster_name }}"
+
+    - name: Check if ssl_truststore.p12 file exist
+      stat: path="{{ maprSslTrustStoreP12 }}"
+      register: truststore_p12
+
+    - name: Check if ssl_truststore.pem file exist
+      stat: path="{{ maprSslTrustStorePem }}"
+      register: truststore_pem
+
+    - name: Save off old truststore.p12 on upgrade
+      command: "mv {{ maprSslTrustStoreP12 }} {{ maprSslTrustStoreP12 }}.sv.{{ ansible_date_time.epoch }}"
+      when: truststore_p12.stat.exists|bool == True
+
+    - name: Save off old truststore.pem on upgrade
+      command: "mv {{ maprSslTrustStorePem }} {{ maprSslTrustStorePem }}.sv.{{ ansible_date_time.epoch }}"
+      when: truststore_pem.stat.exists|bool == True
+
+    - name: Update truststore.pem file on upgrade - ssl_truststore changed
+      command: "{{ mapr_home }}/server/manageSSLKeys.sh convert -N {{ cluster_name }} {{ mapr_home }}/conf/ssl_truststore {{ mapr_home }}/conf/ssl_truststore.pem"
+    when: mapr_version_triple | int >= 620 and
+          userkeystore.stat.exists|bool == False and security == 'master' and (command == "upgrade" or command == "rolling_upgrade") and ansible_fips|bool == False
+
+  - name: Check if moss key file exist
+    stat: path="{{ maprConf }}/private.key"
+    register: privatekey
+
+  - name: Check if manageSSLKey flag exist
+    stat: path="{{ maprManageSSLKeyFlag }}"
+    register: manageSSLKeyFlag
+
+  - block:
+    # This block should be executed only when we upgrade from 6.1.x or 6.2.0 to 7+, but installer is stupid and do not
+    # register the version we upgrade from, or I did not find it. Need to add it somehow and execute only when we upgrade
+    # from 6.1.x OR 6.2.0. Corresponding page: https://docs.datafabric.hpe.com/72/UpgradeGuide/RestartingClusterServices.html
+
+    - name: Run configure -R to create ssl-related files from configure_security_controller.yml
+      command: "{{ mapr_home }}/server/configure.sh -R"
+      register: configure_r
+
+    - fail: msg="configure.sh -R from configure_security_controller.yml returned non-zero exit code"
+      when: configure_r is failed
+
+    - name: Adds a certificate for the specified user to the existing SSL user key or trust store.
+      command: "{{ mapr_home }}/server/manageSSLKeys.sh createusercert -a moss -u *.{{ ansible_domain }} -ug {{cluster_admin_id }}:{{ cluster_admin_group }}"
+      when: privatekey.stat.exists|bool == False and manageSSLKeyFlag.stat.exists|bool == False
+
+    - name: Create SSL user certificates.
+      command: "{{ mapr_home }}/server/manageSSLKeys.sh createusercerts -ug {{cluster_admin_id }}:{{ cluster_admin_group }} -N {{ cluster_name }}"
+      when: privatekey.stat.exists|bool == False and manageSSLKeyFlag.stat.exists|bool == True
+      ignore_errors: True
+
+    - name: Put manageSSLKey flag to indicate manageSSLKeys.sh did the job
+      ansible.builtin.file:
+        path: "{{ maprManageSSLKeyFlag }}"
+        state: touch
+        mode: u=rw,g=r,o=r
+
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+      with_items:
+              - private.key
+              - public.crt
+      register: fetch_700_s3_credentials
+      when: mapr_version_triple | int == 700 and patch_file is not defined
+
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+      with_items:
+              - ssl_userkeystore.pem
+              - ssl_userkeystore-signed.pem
+              - ssl_usertruststore.pem
+      register: fetch_updated_s3_certs
+
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+      with_items:
+              - ssl_userkeystore
+              - ssl_usertruststore
+      register: fetch_userstore_upgrade_non_fips
+      when: ansible_fips|bool == False
+
+    - fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+      with_items:
+              - ssl_userkeystore.bcfks
+              - ssl_usertruststore.bcfks
+      register: fetch_userstore_upgrade_fips
+      when: ansible_fips|bool == True
+
+    when: mapr_version_triple | int >= 700 and
+          security == 'master' and (command == "upgrade" or command == "rolling_upgrade") and
+          manageSSLKeyFlag.stat.exists == False
+
+  - name: Check to see if we already have local copies
+    local_action: stat path='{{ inst_tmp }}/{{ item }}'
+    become: False
+    with_items: "{{ cert_files }}"
+    ignore_errors: True
+    register: local_copies
+
+  - set_fact: missing_keys=True
+    with_items: "{{ local_copies.results }}"
+    when: item.stat.exists|bool == False
+
+  - debug: var=local_copies
+  - debug: var=cert_files
+  - debug: var=post_700_hadoop_credentials
+
+  - name: Store secure cluster files on installer node
+    fetch: src='{{ maprConf }}/{{ item }}' dest='{{inst_tmp}}/' flat=yes fail_on_missing=yes validate_checksum=no
+    with_items: "{{ cert_files }}"
+    when: (cluster_conf.stat.exists|bool == False or key_generated == False or missing_keys|bool == True) and
+           security == 'master'
+
+  - name: Simplify some facts
+    set_fact:
+      above_or_equal_core_700: "{{ True if mapr_version_triple | int >= 700 else False }}"
+      upgrade_or_update: "{{ True if (command == 'upgrade' or command == 'rolling_upgrade' or command == 'update') else False }}"
+      no_key_or_clusters_conf_missing: "{{ True if (cluster_conf.stat.exists == False or key_generated == False or missing_keys == True) else False }}"
+
+  - block:
+    - name: create tokens tar ball
+      shell: "tar -C {{ tokensDirectory }} -czf {{ tokensTarBall }} ."
+
+    - name: fetch tokens tar ball
+      fetch: src='{{ tokensTarBall }}' dest='{{ inst_tmp }}/' flat=yes fail_on_missing=yes validate_checksum=no
+
+    - name: fetch hsm config file
+      fetch: src='{{ hsmConfFile }}' dest='{{ inst_tmp }}/' flat=yes fail_on_missing=yes validate_checksum=no
+
+    - name: fetch credential stores
+      fetch: src='{{ maprConf }}/{{ item }}' dest='{{ inst_tmp }}/' flat=yes fail_on_missing=yes validate_checksum=no
+      with_items: "{{ post_700_hadoop_credentials }}"
+      register: fetch_post_700_hadoop
+      when:  ansible_fips|bool == False
+
+    - name: fetch credential stores(fips)
+      fetch: src='{{ maprConf }}/{{ item }}' dest='{{ inst_tmp }}/' flat=yes fail_on_missing=yes validate_checksum=no
+      with_items: "{{ fips_post_700_hadoop_credentials }}"
+      when: ansible_fips|bool == True
+
+    - name: fetch s3 cert/key
+      fetch: src='{{ maprConf }}/{{ item }}' dest='{{ inst_tmp }}/' flat=yes fail_on_missing=yes validate_checksum=no
+      with_items: "{{ post_700_s3_credentials }}"
+      register: fetch_post_700_s3
+      when: mapr_version_triple | int == 700
+
+    - name: Change permissions on private.key so we can overwrite later
+      local_action: file path='{{inst_tmp}}/{{ item }}' mode='u+rw'
+      with_items: "{{ post_700_s3_credentials }}"
+      register: perm_post_700_s3
+      become: false
+      when: mapr_version_triple | int == 700
+
+    # Core 700 or higher, keys should be missing. Do not execute on upgrade/update to 700
+    when: above_or_equal_core_700 and no_key_or_clusters_conf_missing and security == 'master' 
+          and not (mapr_version_triple | int == 700 and upgrade_or_update)
+
+  # We do change the perms here so we can overwrite the files when we need to
+  # when the files are copied back to the non master nodes they are copied with the correct perms
+  - name: Change permissions on so we can overwrite later
+    local_action: file path='{{inst_tmp}}/{{ item |regex_replace('ca/','') }}' mode='u+rw'
+    become: false
+    with_items: " {{ ssl_files }}"
+    when:  ansible_fips|bool == False
+
+  - name: Change permissions on so we can overwrite later
+    local_action: file path='{{inst_tmp}}/{{ item |regex_replace('ca/','') }}' mode='u+rw'
+    become: false
+    with_items: " {{ fips_ssl_files }}"
+    when:  ansible_fips|bool == True
+
+  - block:
+
+    - name: remove temporarily create symlink for ssl-server.xml
+      file: path="{{ maprConf }}/ssl-server.xml" state=absent
+      when: created_ssl_server_xml is succeeded
+
+    - name: remove temporarily create symlink for ssl-client.xml
+      file: path="{{ maprConf }}/ssl-client.xml" state=absent
+      when: created_ssl_client_xml is succeeded
+    when: cluster_conf.stat.exists | bool == True and is_upgrade|bool == True and
+          mapr_version_triple | int >= 620
+
+  - mapr_state.py: state=11

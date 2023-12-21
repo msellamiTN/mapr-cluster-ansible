@@ -1,0 +1,67 @@
+   - name: Determining if node has Warden present
+     stat: path="{{ mapr_home }}/initscripts/mapr-warden"
+     register: warden_present
+     check_mode: False
+
+   - name: Determining if node has a TaskTracker role
+     stat: path="{{ mapr_home }}/roles/tasktracker"
+     register: tasktrackerRole
+     check_mode: False
+
+   - name: Determining Hadoop mode (YARN vs Classic)
+     check_hadoop_version.py: mapr_user='{{ cluster_admin_id }}' timeout={{timeout.standard}}
+     register: hadoop_mode
+     check_mode: False
+
+   - name: Blacklisting TaskTracker. New jobs will not be assigned to the node
+     shell: "/usr/bin/hadoop1 job -blacklist-tracker {{ansible_fqdn}}"
+     become: True
+     become_user: "{{ cluster_admin_id }}"
+     run_once: True
+     ignore_errors: True
+     when: tasktrackerRole.stat.exists and hadoop_mode.default_mode == "classic"
+
+   - name: Waiting for current tasks on the node to complete
+     action: "wait_till_jobs_done.sh"
+     when: tasktrackerRole.stat.exists and wait_for_jobs
+
+   - name: Gather PIDs
+     shell: "find -H {{ mapr_home }}/pid -type f -print | xargs cat \\{\\} \\; 2> /dev/null"
+     ignore_errors: True
+     register: mapr_pids
+
+   - debug: var=mapr_pids
+
+     # unmount /mapr before stopping warden to try to avoid hung nfs mounts
+   - name: Unmounting /mapr to avoid nfs stuck
+     shell: "umount -f -l /mapr"
+     ignore_errors: True
+     register: umount_mapr
+
+   - debug: var=umount_mapr
+
+   - name: Stopping Warden
+     service: name=mapr-warden state=stopped
+
+   - name: Wait for warden to exit
+     become: False
+     wait_for:
+       path: /var/lock/subsys/mapr-warden
+       state: absent
+
+   - name: kill orphan pids
+     command: "kill -9 {{ item }}"
+     ignore_errors: True
+     with_items:
+       - "{{ mapr_pids.stdout_lines }}"
+
+   - name: Determining if cldb removed its pid file
+     stat: path="{{ mapr_home }}/pid/cldb.pid"
+     register: cldbPidFile
+
+   - name: Remove cldb pid file
+     command: 'rm {{ mapr_home }}/pid/cldb.pid'
+     when: cldbPidFile.stat.exists
+
+   - name: Starting Warden
+     service: name=mapr-warden enabled=yes state=started

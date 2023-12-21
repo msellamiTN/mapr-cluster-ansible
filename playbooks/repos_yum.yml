@@ -1,0 +1,229 @@
+---
+#
+# Playbook Name:: repos_yum
+#
+# Copyright 2013, MapR Technologies
+#
+# This playbook initializes repo settings for MapR software on RedHat nodes
+#
+
+- name: Configuring package repository for RedHat based OS
+  hosts: RedHat
+  serial: "{{ forks }}"
+  gather_facts: False
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}" # used by callbacks from installed nodes to installer backend
+    repo_proxy: ""
+
+  vars:
+    repo_subdir: ""
+    do_protected_repo: False
+
+  tasks:
+  - set_fact: repo_subdir=/redhat
+    when: not repo_full_url
+
+  - file: path=/etc/yum.repos.d state=directory mode=755
+
+  - debug: var=no_proxy
+    when: mapr_debug is defined
+
+  - debug: var=http_proxy
+    when: mapr_debug is defined
+
+  - debug: var=repo_core_url
+    when: mapr_debug is defined
+
+  - stat: path={{ core_repo_file_redhat }}
+    register: core_file
+    check_mode: False
+
+  - set_fact: repo_proxy={{ http_proxy }}
+    when: http_proxy is defined and http_proxy != ""
+
+    # override for access between hpe and mapr datacenters
+  - set_fact: repo_proxy="_none_"
+    when: '"dfaf.mip.storage.hpecorp.net" in repo_core_url'
+  
+  - set_fact:
+      do_protected_repo: True
+    when: repo_user is defined and repo_password is defined and repo_user != "" and repo_password != ""
+  
+  # TODO: Too many tasks, need to change this to use 'ansible.builtin.lineinfile'
+  - name: Setting the core rpm repository for different cases (Not protected)
+    block: 
+    - yum_repository:
+        file="{{ core_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Core'
+        description='MapR Core Components'
+        baseurl="{{ repo_core_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        proxy="{{ repo_proxy }}"
+        state="present"
+      when: repo_proxy is defined
+
+    - yum_repository:
+        file="{{ core_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Core'
+        description='MapR Core Components'
+        baseurl="{{ repo_core_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        state="present"
+      when: repo_proxy is not defined
+    when: not do_protected_repo
+
+  - name: Setting the core rpm repository for different cases (protected)
+    block:      
+    - yum_repository:
+        file="{{ core_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Core'
+        description='MapR Core Components'
+        baseurl="{{ repo_core_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        username="{{ repo_user }}"
+        password="{{ repo_password }}"
+        proxy="{{ repo_proxy }}"
+        state="present"
+      when: repo_proxy is defined
+
+    - yum_repository:
+        file="{{ core_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Core'
+        description='MapR Core Components'
+        baseurl="{{ repo_core_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        username="{{ repo_user }}"
+        password="{{ repo_password   }}"
+        state="present"
+      when: repo_proxy is not defined
+    when: do_protected_repo
+
+  - ansible.builtin.lineinfile:
+      dest={{ core_repo_file_redhat }}
+      regexp='^baseurl.*'
+      line='baseurl = {{ repo_core_url }}{{ repo_subdir }}'
+      state=present
+    when: core_file.stat.exists|bool == True
+
+  - stat: path={{ eco_repo_file_redhat }}
+    register: eco_file
+    check_mode: False
+
+  - name: Setting the ecosystem rpm repository for different cases (Not protected)
+    block: 
+    - yum_repository:
+        file="{{ eco_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Ecosystem'
+        description='MapR Ecosystem Components'
+        baseurl="{{ repo_eco_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        proxy="{{ repo_proxy }}"
+        state="present"
+      when: repo_proxy is defined
+
+    - yum_repository:
+        file="{{ eco_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Ecosystem'
+        description='MapR Ecosystem Components'
+        baseurl="{{ repo_eco_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        state="present"
+      when: repo_proxy is not defined
+    when: not do_protected_repo
+
+  - name: Setting the ecosystem rpm repository for different cases (protected)
+    block:      
+    - yum_repository:
+        file="{{ eco_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Ecosystem'
+        description='MapR Ecosystem Components'
+        baseurl="{{ repo_eco_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        username="{{ repo_user }}"
+        password="{{ repo_password }}"
+        proxy="{{ repo_proxy }}"
+        state="present"
+      when: repo_proxy is defined
+
+    - yum_repository:
+        file="{{ eco_repo_file_redhat | regex_replace('.repo$','') }}"
+        name='MapR_Ecosystem'
+        description='MapR Ecosystem Components'
+        baseurl="{{ repo_eco_url }}{{ repo_subdir }}"
+        gpgcheck=1
+        enabled=1
+        protect=1
+        username="{{ repo_user }}"
+        password="{{ repo_password   }}"
+        state="present"
+      when: repo_proxy is not defined
+    when: do_protected_repo
+  
+  - ansible.builtin.lineinfile:
+        dest={{ eco_repo_file_redhat }}
+        regexp="^baseurl.*"
+        line='baseurl = {{ repo_eco_url }}{{ repo_subdir }}'
+        state=present
+    when: eco_file.stat.exists|bool == True
+
+  - command: yum -q clean expire-cache
+
+  - command: yum -q clean metadata
+
+  - yum:
+      name: yum-utils
+      state: latest
+    register: yum_utils_installed
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_utils_installed is succeeded
+    when: prebuilt_image is not defined or prebuilt_image == False
+
+  - name: Clean up dupliucates and finish transaction
+    command: yum-complete-transaction --cleanup-only
+    when:
+      - ansible_distribution_major_version|int == "7"
+      - ansible_distribution_major_version|int == "6"
+
+  - name: Clean up duplicates
+    command: package-cleanup --cleandupes
+    when:
+      - ansible_distribution_major_version|int == "8"
+
+  - command: yum -y clean all --disablerepo=* --enablerepo=MapR_*
+    ignore_errors: True
+    when: prebuilt_image is not defined or prebuilt_image == False
+
+  - command: mv -f /etc/yum.repos.d/mapr_core.repo
+        /etc/yum.repos.d/mapr_core.repo.disabled
+    when: yum_utils_installed is failed
+
+  - command: mv -f /etc/yum.repos.d/mapr_ecosystem.repo
+        /etc/yum.repos.d/mapr_ecosystem.repo.disabled
+    when: yum_utils_installed is failed
+
+  - fail: msg="Unable to configure MapR repositories. Confirm that targets
+        {{ repo_core_url }} and {{ repo_eco_url }} are accessible"
+    when: yum_utils_installed is failed
+
+  - rpm_key: key="/tmp/gnugpg.key"
+
+  - rpm_key: key="/tmp/maprgpg.key"
+
+  - mapr_state.py: state=7

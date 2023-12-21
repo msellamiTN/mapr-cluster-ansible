@@ -1,0 +1,238 @@
+---
+#
+# Playbook Name:: configure
+#
+# Copyright 2013, MapR Technologies
+#
+#   Very simple implementation.   Calls MapR configure.sh utility
+#   with specifications from the environment.
+#
+
+- name: Configuring MapR Ecosystem Minions
+  hosts: all
+  serial: "{{ forks }}"
+  gather_facts: False
+
+  vars:
+    isUpdate: "{{ is_update | default(false) }}"
+    inst_tmp: "{{ mapr_home }}/installer/data/tmp"
+    fluentdRolesFile: "{{ mapr_home }}/roles/fluentd"
+    kibanaRolesFile: "{{ mapr_home }}/roles/kibana"
+    security: "{{ mapr.node.security|default('disabled') }}"
+    esSecurity: "{{ mapr.node.es_security|default('disabled') }}"
+    esNodes: "{{ mapr.groups.es }}"
+
+  tasks:
+  # Retrieve elasticsearch security credentials
+  - debug: var=esSecurity
+
+  - name: Determine MapR version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'"
+    check_mode: False
+    register: mapr_version_triple
+
+  - block:
+    - local_action: stat path="{{inst_tmp}}/es-root-ca.pem"
+      become: False
+      register: es_ca_file
+    - local_action: stat path="{{inst_tmp}}/truststore.jks"
+      become: False
+      register: es_truststore_file
+    - local_action: stat path="{{inst_tmp}}/sg2.yml"
+      become: False
+      register: es_sg2_file
+    - local_action: stat path="{{inst_tmp}}/sg_http_{{ ansible_fqdn }}.yml"
+      become: False
+      register: es_http_file_fqdn
+    - local_action: stat path="{{inst_tmp}}/sg_http_{{ ansible_hostname }}.yml"
+      become: False
+      register: es_http_file_hostname
+    - local_action: stat path="{{inst_tmp}}/sg_ssl_{{ ansible_fqdn }}.yml"
+      become: False
+      register: es_ssl_file_fqdn
+    - local_action: stat path="{{inst_tmp}}/sg_ssl_{{ ansible_hostname }}.yml"
+      become: False
+      register: es_ssl_file_hostname
+    - local_action: stat path="{{inst_tmp}}/{{ ansible_fqdn }}-srvr-keystore.jks"
+      become: False
+      register: srvr_trststr_file_fqdn
+    - local_action: stat path="{{inst_tmp}}/{{ ansible_hostname }}-srvr-keystore.jks"
+      become: False
+      register: srvr_trststr_file_hostname
+    - local_action: stat path="{{inst_tmp}}/.keystore_password"
+      become: False
+      register: keystore_password
+    - local_action: stat path="{{inst_tmp}}/admin-usr-clientCombo.pem"
+      become: False
+      register: admin_usr_client_cert_file
+    - local_action: stat path="{{inst_tmp}}/admin-usr-signed.pem"
+      become: False
+      register: admin_usr_signed_cert_file
+    - local_action: stat path="{{inst_tmp}}/admin-usr-private-key.pem"
+      become: False
+      register: admin_usr_private_key_file
+    - local_action: stat path="{{inst_tmp}}/fluentd-usr-clientCombo.pem"
+      become: False
+      register: fluentd_usr_client_cert_file
+    - local_action: stat path="{{inst_tmp}}/fluentd-usr-signed.pem"
+      become: False
+      register: fluentd_usr_signed_cert_file
+    - local_action: stat path="{{inst_tmp}}/fluentd-usr-private-key.pem"
+      become: False
+      register: fluentd_usr_private_key_file
+    - local_action: stat path="{{inst_tmp}}/kibanaserver-usr-clientCombo.pem"
+      become: False
+      register: kibana_server_usr_client_cert_file
+    - local_action: stat path="{{inst_tmp}}/kibanaserver-usr-signed.pem"
+      become: False
+      register: kibana_server_usr_signed_cert_file
+    - local_action: stat path="{{inst_tmp}}/kibanaserver-usr-private-key.pem"
+      become: False
+      register: kibana_server_usr_private_key_file
+    - set_fact: es_keygen_failed="{{True if (es_ca_file.stat.exists|bool == False or
+                                             es_truststore_file.stat.exists|bool == False or
+                                             es_sg2_file.stat.exists|bool == False or
+                                             (es_http_file_fqdn.stat.exists|bool == False and
+                                              es_http_file_hostname.stat.exists|bool == False) or
+                                              (es_ssl_file_fqdn.stat.exists|bool == False and
+                                               es_ssl_file_hostname.stat.exists|bool == False)) else False}}"
+
+    - set_fact: es_keygen_failed=True
+      when: admin_usr_client_cert_file.stat.exists|bool == False and
+            mapr_version_triple.stdout | int >= 601 and
+            esSecurity == 'enabled' and es_keygen_failed == False
+
+    - set_fact: es_keygen_failed=True
+      when: (admin_usr_signed_cert_file.stat.exists|bool == False or
+            admin_usr_private_key_file.stat.exists|bool == False or
+            fluentd_usr_client_cert_file.stat.exists|bool == False or
+            fluentd_usr_signed_cert_file.stat.exists|bool == False or
+            fluentd_usr_private_key_file.stat.exists|bool == False or
+            kibana_server_usr_client_cert_file.stat.exists|bool == False or
+            kibana_server_usr_signed_cert_file.stat.exists|bool == False or
+            kibana_server_usr_private_key_file.stat.exists|bool == False) and
+            mapr_version_triple.stdout | int >= 610 and
+            esSecurity == 'enabled' and es_keygen_failed == False
+
+    - block:
+      - shell: "ls -1d {{ mapr_home }}/elasticsearch/elasticsearch-* | cut -d'-' -f2"
+        register: es_version
+
+      - debug: var=es_version
+
+      - set_fact: esEtcEs="{{ mapr_home }}/elasticsearch/elasticsearch-{{ es_version.stdout }}/etc/elasticsearch/"
+
+      - copy: src="{{inst_tmp}}/es-root-ca.pem" dest="{{ esEtcEs }}/ca/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_es_root_ca
+
+      - copy: src="{{inst_tmp}}/{{ item }}" dest="{{ esEtcEs }}/keystores/" mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        with_items:
+          - truststore.jks
+          - admin-usr-keystore.jks
+        register: cp_es_trststr
+
+      - copy: src="{{inst_tmp}}/{{ ansible_fqdn }}-srvr-keystore.jks" dest="{{ esEtcEs }}/keystores/" mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_es_trststr
+        when: srvr_trststr_file_fqdn.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/{{ ansible_hostname }}-srvr-keystore.jks" dest="{{ esEtcEs }}/keystores/" mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_es_trststr
+        when: srvr_trststr_file_hostname.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/{{ item }}" dest="{{ esEtcEs }}/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        with_items:
+          - sg2.yml
+          - "sg_http_{{ ansible_fqdn }}.yml"
+          - "sg_ssl_{{ ansible_fqdn }}.yml"
+        register: cp_es_cfg
+        when: es_http_file_fqdn.stat.exists|bool == True and es_ssl_file_fqdn.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/{{ item }}" dest="{{ esEtcEs }}/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        with_items:
+          - sg2.yml
+          - "sg_http_{{ ansible_hostname }}.yml"
+          - "sg_ssl_{{ ansible_hostname }}.yml"
+        register: cp_es_cfg
+        when: es_http_file_hostname.stat.exists|bool == True and es_ssl_file_hostname.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/.keystore_password" dest="{{ esEtcEs }}/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_es_keystore_pw
+        when: keystore_password.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/admin-usr-clientCombo.pem" dest="{{ esEtcEs }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_es_admin_client_cert
+        when: admin_usr_client_cert_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/admin-usr-signed.pem" dest="{{ esEtcEs }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_es_admin_signed_cert
+        when: admin_usr_signed_cert_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/admin-usr-private-key.pem" dest="{{ esEtcEs }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_es_admin_private_key_cert
+        when: admin_usr_private_key_file.stat.exists|bool == True
+
+      when: esSecurity == 'enabled' and inventory_hostname in esNodes and not es_keygen_failed
+
+    - stat: path="{{ fluentdRolesFile }}"
+      register: fluentd_role
+
+    - stat: path="{{ kibanaRolesFile }}"
+      register: kibana_role
+
+    - block:
+      - shell: "ls -1d {{ mapr_home }}/kibana/kibana-* | cut -d'-' -f2"
+        register: kibana_version
+
+      - debug: var=kibana_version
+
+      - set_fact: kibanaConfigDir="{{ mapr_home }}/kibana/kibana-{{ kibana_version.stdout }}/config/"
+
+      - copy: src="{{inst_tmp}}/es-root-ca.pem" dest="{{ kibanaConfigDir }}/ca/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_kibana_root_ca
+        when: es_ca_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/.keystore_password" dest="{{ kibanaConfigDir }}/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_kibana_keystore_pw
+        when: keystore_password.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/kibanaserver-usr-clientCombo.pem" dest="{{ kibanaConfigDir }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_kibana_admin_usr_client_cert
+        when: kibana_server_usr_client_cert_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/kibanaserver-usr-signed.pem" dest="{{ kibanaConfigDir }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_kibana_admin_usr_client_cert
+        when: kibana_server_usr_signed_cert_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/kibanaserver-usr-private-key.pem" dest="{{ kibanaConfigDir }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_kibana_admin_usr_private_key_cert
+        when: kibana_server_usr_private_key_file.stat.exists|bool == True
+      when: kibana_role.stat.exists|bool == True and (esSecurity == 'enabled' or esSecurity == 'master')
+
+
+    - block:
+      - shell: "ls -1d {{ mapr_home }}/fluentd/fluentd-* | cut -d'-' -f2"
+        register: fluentd_version
+
+      - debug: var=fluentd_version
+
+      - set_fact: fluentdConfigDir="{{ mapr_home }}/fluentd/fluentd-{{ fluentd_version.stdout }}/etc/fluentd/"
+
+      - copy: src="{{inst_tmp}}/es-root-ca.pem" dest="{{ fluentdConfigDir }}/ca/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_fluentd_root_ca
+        when: es_ca_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/fluentd-usr-signed.pem" dest="{{ fluentdConfigDir }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_fluentd_admin_usr_client_cert
+        when: fluentd_usr_signed_cert_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/fluentd-usr-private-key.pem" dest="{{ fluentdConfigDir }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_fluentd_admin_usr_client_cert
+        when: fluentd_usr_private_key_file.stat.exists|bool == True
+
+      - copy: src="{{inst_tmp}}/fluentd-usr-clientCombo.pem" dest="{{ fluentdConfigDir }}/certs/" mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_fluentd_admin_usr_client_cert
+        when: fluentd_usr_client_cert_file.stat.exists|bool == True
+      when: fluentd_role.stat.exists|bool == True and (esSecurity == 'enabled' or esSecurity == 'master')
+    when: mapr_version_triple.stdout | int < 620
+
+  - mapr_state.py: state=21

@@ -1,0 +1,70 @@
+---
+#
+# Playbook Name:: os_security
+#
+# Copyright 2017, MapR Technologies
+#
+# Purpose : Handle security configuration on the cluster nodes
+#
+#    ssh : MapR clusters with "security" enabled require exchanging security
+#    credentials via scp and retrieval of manifest file from control node
+#    Set sshd_config to allow password-based access
+#
+#    firewall : disable firewall
+#    apparmor : disable firewall
+#
+
+- name: Configuring OS Security
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+    security: "{{ mapr.node.security|default('disabled') }}"
+
+  tasks:
+  - debug: msg="MapR security setting is {{ security }}"
+
+  - name: Turning of ChallengeResponseAuthentication for ssh
+    ansible.builtin.lineinfile:
+        dest="/etc/ssh/sshd_config"
+        regexp="^.?ChallengeResponseAuthentication .*"
+        line="ChallengeResponseAuthentication yes"
+        state=present
+    register: sshd_config
+    when: ssh_method is not defined or (ssh_method is defined and ssh_method == 'PASSWORD')
+    # when: security == 'master' or security == 'enabled'
+
+  - name: Restarting ssh due to changed sshd config
+    service: name=ssh enabled=yes state=restarted
+    when: ansible_os_family == 'Debian' and sshd_config.changed
+
+  - name: Restarting sshd due to changed sshd config
+    service: name=sshd enabled=yes state=restarted
+    when: ansible_os_family != 'Debian' and sshd_config.changed
+
+  # The default UNIX firewall config on Ubuntu seems less draconian
+  # than the default RedHat version .. so no need to shut it down yet.
+  # TBD : get smarter about what ports are open.
+  # - service: name=ufw enabled=no state=stopped
+  #   when: ansible_os_family == 'Debian' and (security == 'master' or
+  #       security == 'enabled') and not docker
+
+  - name: Stopping iptables
+    service: name=iptables enabled=no state=stopped
+    ignore_errors: True
+    when: ansible_os_family == 'RedHat' and
+        ansible_distribution_major_version|int < 7 and not docker
+
+  - name: Stopping firewalld 
+    service: name=firewalld enabled=no state=stopped
+    ignore_errors: True
+    when: ansible_os_family == 'RedHat' and
+        ansible_distribution_major_version|int >= 7 and not docker
+
+  - name: Stopping apparmor
+    service: name=apparmor enabled=no state=stopped
+    ignore_errors: True
+    when: ansible_os_family == 'Debian' and
+        ansible_distribution_major_version|int >= 14 and not docker
+
+  - mapr_state.py: state=3

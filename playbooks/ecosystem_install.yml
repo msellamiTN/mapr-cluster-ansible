@@ -1,0 +1,139 @@
+---
+#
+# Playbook Name:: ecosystem
+#
+# Copyright 2017, MapR Technologies
+
+- name: Installing MapR Ecosystem
+  hosts: all
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    pkg_version_separator: "{% if ansible_os_family == 'RedHat' %}-{% elif
+        ansible_os_family == 'Debian' %}={% elif ansible_os_family == 'Suse'
+        %}<={% endif %}"
+    pkg_version_wildchar: "{% if ansible_os_family in ['RedHat','Debian']
+        %}*{% elif ansible_os_family == 'Suse' %}.99999999999999{% endif %}"
+    pkg_sign_check: ""
+
+  tasks:
+
+  # include version numbers for RH/Suse
+  - set_fact: eco_pkgs="{% for item in mapr.node.eco_packages | dictsort %}{{ item[0] }}{{ pkg_version_separator }}{{ item[1] }}{{ pkg_version_wildchar }}{% if not loop.last %} {% endif %}{% endfor %}"
+    when: ansible_os_family in ['RedHat','Suse']
+
+  # exclude version numbers for debian
+  - set_fact: eco_pkgs="{% for item in mapr.node.eco_packages| dictsort %}{{ item[0] }}{% if not loop.last %} {% endif %}{% endfor %}"
+    when: ansible_os_family == 'Debian'
+
+  - debug: msg="Installing {{ eco_pkgs }}"
+
+  - apt:
+      name: "{{ eco_pkgs | regex_replace(' ',',') }}"
+      state: latest
+    register: apt_eco_install
+    retries: "{{ package_manager_retries }}"
+    until: apt_eco_install is succeeded
+    delay: "{{ package_manager_delay_sec }}"
+    when: ansible_os_family == 'Debian' and mep_version is defined and eco_pkgs != ''
+
+  - yum:
+      name: "{{ eco_pkgs | regex_replace(' ', ',') }}"
+      state: latest
+    register: yum_eco_install
+    retries: "{{ package_manager_retries }}"
+    until: yum_eco_install is succeeded
+    delay: "{{ package_manager_delay_sec }}"
+    when: ansible_os_family == 'RedHat' and eco_pkgs != ''
+
+  - zypper:
+      name: "{{ eco_pkgs | regex_replace(' ',',') }}"
+      state: latest
+    register: zypper_eco_install
+    retries: "{{ package_manager_retries }}"
+    until: zypper_eco_install is succeeded
+    delay: "{{ package_manager_delay_sec }}"
+    when: ansible_os_family == 'Suse' and eco_pkgs != ''
+
+  # get versions of installed ecosystems so that we can expand the 2 digit group versions
+  - block:
+    - shell: "rpm -qa | fgrep {{ item.key }}-{{ item.value }}"
+      with_dict: "{{ mapr.node.eco_packages }}"
+      register: eco_pkg_versions
+      ignore_errors: true
+
+    - debug: var=eco_pkg_versions
+
+    - fail: msg="Incorrect ecosystem package versions found installed"
+      when: eco_pkg_versions is failed
+
+
+    # Populate the installed version variables into the mapr.node.variables array so stage2
+    # can see them.
+    - block:
+      - set_fact:
+          eco_p_version: "{%if item.stdout_lines|length > 0 %}{{ item.stdout_lines[0] |
+            regex_replace(item.item.key + '-','') |
+            regex_replace('\\.\\d+-\\d+\\..*','')}}{%endif%}"
+        with_items: "{{ eco_pkg_versions.results }}"
+        register: eco_p_versions
+
+      - debug: var=eco_p_version
+
+      - set_fact:
+          mapr: "{{ mapr| combine({'node': {'variables': { item.item.item.key |
+            regex_replace('mapr-','') | regex_replace('-','') | upper +
+            '_INSTALLED_VERSION': item.ansible_facts.eco_p_version }}}, recursive=True) }}"
+        with_items: "{{ eco_p_versions.results }}"
+      when: eco_pkg_versions is not skipped
+    when: ansible_os_family == 'RedHat' or ansible_os_family == 'Suse'
+
+  - block:
+    - shell: "dpkg -l | fgrep '{{ item.key }} ' | awk '{print $2\"-\"$3}'"
+      with_dict: "{{ mapr.node.eco_packages }}"
+      register: eco_pkg_versions
+
+    - debug: var=eco_pkg_versions
+
+    - block:
+      - set_fact:
+          eco_p_version: "{%if item.stdout_lines|length > 0 %}{{ item.stdout_lines[0] |
+            regex_replace(item.item.key + '-','') |
+            regex_replace('\\.\\d\\d+','')}}{%endif%}"
+        with_items: "{{ eco_pkg_versions.results }}"
+        register: eco_p_versions
+
+      - debug: var=eco_p_version
+
+      # Populate the installed version variables into the mapr.node.variables array so stage2
+      # can see them.
+      - set_fact:
+          mapr: "{{ mapr| combine({'node': {'variables': { item.item.item.key |
+            regex_replace('mapr-','') | regex_replace('-','') | upper +
+            '_INSTALLED_VERSION': item.ansible_facts.eco_p_version }}}, recursive=True) }}"
+        with_items: "{{ eco_p_versions.results }}"
+      when: eco_pkg_versions is not skipped
+    when: ansible_os_family == 'Debian'
+
+  # fix issue with upgrade and elasticsearch, where the role file gets removed
+  - debug: var=mapr.node.eco_packages
+
+  - debug: var=mapr.node.eco_packages['mapr-elasticsearch']
+    when:  "'mapr-elasticsearch' in mapr.node.eco_packages"
+
+  - block:
+    - name: Check to see if the elasticsearch role file exist
+      stat: path="{{ mapr_home }}/roles/elasticsearch"
+      register: es_role
+
+    - name: recreate the role file if it got removed
+      file: path="{{ mapr_home }}/roles/elasticsearch" state=touch
+      when: not es_role.stat.exists
+    when: "mapr.node.eco_packages is defined and 'mapr-elasticsearch' \
+           in mapr.node.eco_packages and command is defined and (command == 'upgrade' or command == 'rolling_upgrade')"
+
+  - mapr_state.py: state=16

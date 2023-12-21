@@ -1,0 +1,17 @@
+---
+#
+# Playbook Name:: Image create
+
+- name: Image create
+  hosts: all
+  connection: local
+  serial: "{{ forks }}"
+  gather_facts: no
+
+  tasks:
+    - name: task1
+      debug: msg="Entering image playbook"
+    - name: task2
+      shell: echo host $(hostname)
+    - name: task3
+      debug: msg="Image stanza {{stanza}}"

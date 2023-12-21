@@ -1,0 +1,15 @@
+---
+
+- name: start azure instances
+  mapr_azure_startup.py:
+    auth_type: service_principal
+    subscription_id: "{{ provider.config.subscription_id }}"
+    tenant: "{{ provider.config.tenant_id }}"
+    client_id: "{{ provider.config.client_id }}"
+    secret: "{{ provider.encryptedConfig.secret }}"
+    resource_group: "{{ provider.config.resource_group }}"
+
+# This pause allows the servers to start taking SSH connections before starting services
+# Ultimately we should get the ips from the mapr_azure_startup module and make sure we can acces them
+- pause:
+    seconds: 120

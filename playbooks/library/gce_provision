@@ -1,0 +1,285 @@
+#!/usr/bin/env python
+
+from ansible.module_utils.basic import *
+from httplib2 import Http
+from googleapiclient import discovery
+from oauth2client.contrib.gce import AppAssertionCredentials
+import urllib2
+import time
+
+from ansible.module_utils.mapr_base import MapRBase
+
+
+# TODO:
+# Error handling
+# Debug Logging
+# Handle cases where resources exist
+# All nodes in same zone - support for multiple zone
+# Instance group no part of deployment - how to fix it
+class GCEProvision(MapRBase):
+    MAX_RETRY = 20
+    SLEEP_TIME = 2
+
+    def __init__(self, module=None, description="Updates GCE Instance Template and return instance IPs"):
+        self.module = module
+        self.instance_template = module.params['instance_template']
+        self.disk_count = module.params['disk_count']
+        self.disk_size = module.params['disk_size']
+        self.disk_type = module.params['disk_type']
+        self.disk_interface = module.params['disk_interface']
+        self.host_count = module.params['host_count']
+        self.scale = module.params['scale']
+        self.use_installer = module.params['use_installer']
+        self.use_ephemeral = module.params['use_ephemeral']
+        self.project_id = self.get_project_id()
+        self.service_account_email = self.get_service_account_email()
+        self.gce_zone = self.get_name(self.get_gce_zone())
+        self.name = module.params['name']
+        self.instance_group_name = module.params['instance_group_name']
+        self.ssh_key_pub = module.params['ssh_key_pub']
+        self.error = ""
+
+    def create_instance_group(self, compute):
+        name = self.name + "-instance-group"
+        config = {
+            "name": name,
+            "instanceTemplate": "global/instanceTemplates/" +
+                                self.instance_template,
+            "targetSize": self.host_count,
+            "baseInstanceName": self.name
+        }
+        compute.instanceGroupManagers().insert(
+            project=self.project_id,
+            zone=self.gce_zone,
+            body=config
+        ).execute()
+        # wait for instances to be available in the instance group
+        retry_count = 0
+        while True:
+            response = compute.instanceGroups().listInstances(
+                project=self.project_id,
+                zone=self.gce_zone,
+                instanceGroup=name,
+                body=''
+            ).execute()
+            if 'items' in response and len(response['items']) == self.host_count:
+                break
+            retry_count += 1
+            if retry_count == GCEProvision.MAX_RETRY:
+                self.error = "Timed out waiting for instances to be available"
+                break
+            time.sleep(GCEProvision.SLEEP_TIME)
+        return [i['instance'] for i in response['items']]
+
+    def update_instance_group(self, compute):
+        size = self.host_count
+        if self.scale:
+            response = compute.instanceGroups().get(
+                project=self.project_id,
+                zone=self.gce_zone,
+                instanceGroup=self.instance_group_name
+            ).execute()
+            size = response['size'] + self.host_count
+
+        compute.instanceGroupManagers().resize(
+            project=self.project_id,
+            zone=self.gce_zone,
+            instanceGroupManager=self.instance_group_name,
+            size=size
+        ).execute()
+
+        # wait for instances to be available in the instance group
+        retry_count = 0
+        while True:
+            response = compute.instanceGroups().listInstances(
+                project=self.project_id,
+                zone=self.gce_zone,
+                instanceGroup=self.instance_group_name,
+                body=''
+            ).execute()
+            if 'items' in response and len(response['items']) == size:
+                break
+            retry_count += 1
+            if retry_count == GCEProvision.MAX_RETRY:
+                self.error = "Timed out waiting for instances to be available"
+                break
+            time.sleep(GCEProvision.SLEEP_TIME)
+        return [i['instance'] for i in response['items']]
+
+    def add_disks_to_instances(self, compute, instances):
+        response = compute.disks().list(
+            project=self.project_id,
+            zone=self.gce_zone,
+            filter='name eq ' + self.name + '-.+-disk.+'
+        ).execute()
+        disks = [i['name'] for i in response['items']] \
+            if 'items' in response else []
+
+        for i in instances:
+            name = self.get_name(i)
+            # TBD: if disk is present and attached to the instance, skip
+            disk_count = self.disk_count
+            # You can have a max of 8 local-ssd
+            if self.disk_type == 'local-ssd' and self.disk_count > 8:
+                disk_count = 8
+            for n in list(range(disk_count)):
+                disk_name = name + '-disk' + str(n)
+                if disk_name in disks:
+                    # skip
+                    continue
+                config = {
+                    "name": disk_name,
+                    "sizeGb": self.disk_size,
+                    "type": 'https://www.googleapis.com/compute/v1/projects/' +
+                            self.project_id + '/zones/' + self.gce_zone +
+                            '/diskTypes/' + self.disk_type
+                }
+                if self.disk_type == 'local-ssd':
+                    config['interface'] = self.disk_interface
+
+                compute.disks().insert(
+                    project=self.project_id,
+                    zone=self.gce_zone,
+                    body=config
+                ).execute()
+        # wait for disks to be READY
+        retry_count = 0
+        while True:
+            response = compute.disks().list(
+                project=self.project_id,
+                zone=self.gce_zone,
+                filter='name eq ' + self.name + '-.+-disk.+'
+            ).execute()
+            for disk in response['items']:
+                if disk['status'] != "READY":
+                    retry_count += 1
+                    if retry_count == GCEProvision.MAX_RETRY:
+                        self.error = "Timed out waiting for disks to be ready"
+                        break
+                    time.sleep(2)
+                    continue
+            break
+        if self.error != "":
+            return
+        # attach disk to respective machine
+        for item in response['items']:
+            disk = item['selfLink']
+            name = self.get_name(disk)
+            machine = name[:name.rfind('-')]
+            dconfig = {
+                "source": disk,
+                "autoDelete": True
+            }
+            compute.instances().attachDisk(
+                project=self.project_id,
+                zone=self.gce_zone,
+                instance=machine,
+                body=dconfig
+            ).execute()
+
+    def get_ips_and_set_ssh_key(self, compute, instances):
+        ips = []
+
+        for instance in instances:
+            name = self.get_name(instance)
+            response = compute.instances().get(
+                project=self.project_id,
+                zone=self.gce_zone,
+                instance=name
+            ).execute()
+            ips.append(response['networkInterfaces'][0]['networkIP'])
+            keys = ''
+            for item in response['metadata']['items']:
+                if item['key'] == 'ssh-keys':
+                    keys = item['value']
+            keys = keys + '\n' + self.ssh_key_pub
+            body = {
+                "items": [
+                    {
+                        "key": "ssh-keys",
+                        "value": keys
+                    }
+                ],
+                "fingerprint": response['metadata']['fingerprint']
+            }
+            compute.instances().setMetadata(
+                project=self.project_id,
+                zone=self.gce_zone,
+                instance=name,
+                body=body
+            ).execute()
+
+        return ips
+
+    def update(self):
+        credentials = AppAssertionCredentials(self.service_account_email)
+        http_auth = credentials.authorize(Http())
+        compute = discovery.build('compute', 'v1', http=http_auth)
+        instances = self.update_instance_group(compute)
+        if len(instances) == 0:
+            self.error = "number of instances is zero"
+        if self.error == "" and self.disk_type != 'local-ssd':
+            self.add_disks_to_instances(compute, instances)
+        if self.error == "":
+            self.module.exit_json(changed=True,
+                ips=self.get_ips_and_set_ssh_key(compute, instances))
+        else:
+            self.module.fail_json(msg=self.error)
+
+    def get_service_account_email(self):
+        return self.read_url('http://metadata.google.internal/computeMetadata/'
+                             'v1/instance/service-accounts/default/email')
+
+    def get_project_id(self):
+        return self.read_url('http://metadata.google.internal/computeMetadata/'
+                             'v1/project/project-id')
+
+    def get_gce_zone(self):
+        return self.read_url('http://metadata.google.internal/computeMetadata/'
+                             'v1/instance/zone')
+
+    @staticmethod
+    def read_url(url):
+        req = urllib2.Request(url)
+        req.add_header('Metadata-Flavor', 'Google')
+        resp = urllib2.urlopen(req)
+        return resp.read()
+
+    @staticmethod
+    def get_name(url):
+        return url[url.rfind('/')+1:]
+
+
+def main():
+    module = AnsibleModule(argument_spec=dict(
+        instance_template=dict(type='str', required=False),
+        name=dict(type='str'), instance_group_name=dict(type='str'),
+        disk_count=dict(type='int'), disk_size=dict(type='int'),
+        disk_type=dict(type='str'),
+        disk_interface=dict(type='str', required=False, default="SCSI"),
+        host_count=dict(type='int'),
+        scale=dict(type='bool'), use_installer=dict(type='bool'),
+        ssh_key_pub=dict(type='str')))
+    m = GCEProvision(module)
+    m.update()
+
+
+main()
+
+# params = {
+#     "instance_template": "mapr-template",
+#     "instance_group_name": "mapr-group"
+#     "disk_count": 2,
+#     "disk_size": 20,
+#     "disk_type": "pd-standard",
+#     "host_count": 1,
+#     "scale": False,
+#     "use_installer": True,
+#     "use_ephemeral": True,
+#     "name": 'nsen-test',
+#     "ssh_key_pub": "joe: ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDFZHopMJ/+HDeiaqCT1zK7W/Rje8X2YU5nXUEQIe9wfjwYOTWewmFrHFCQatXvfuv85QW/DDX42S9qov70oemTKO+WX8lqFltQ/jtzrX6OliT1OiF3Nnh/wh8sFVRlubg6n1N5GXQ5mSPiRBw+3ht+NQWaJy433yYSVQ/np2Ij0UEbGZa5rPr+hMZWvPhlZbSnVcjhS7a7fPzvEsg43i0mfBkvwnWFHxeSTkQbQ0TpNNFtGSvY/DfP7nMu5ZT8fGuIV9Vdin/nK2P/vXjxyhROXcJEcM02fYxzs/OP2uTdVyl0o5n7awQb222PsVrVBKZHeTfu/zNtNE7JQrPfPhib joe"
+# }
+#
+# from maprinstaller.MockAnsibleModule import MockAnsibleModule
+# gce = GCEProvision(MockAnsibleModule(params))
+# gce.update()

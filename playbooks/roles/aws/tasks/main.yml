@@ -1,0 +1,161 @@
+---
+
+# AWS Instance Provisioning
+# Create EC2 instances and register the instances with
+# MapR installer.
+
+# First run, generate keys and update launch configuration
+# If run multiple times, it will not create or update existing keys
+#- set_fact:
+#    k1: "{{ provider.config.auto_scaling_group | to_uuid }}"
+#
+#- set_fact:
+#    key_name: "{{ cluster_name }}-{{ k1.split('-')[4] }}"
+#
+#- name: Create EC2 key
+#  ec2_key:
+#    name: "{{ key_name }}"
+#    region: "{{ provider.config.aws_region }}"
+#  register: ec2_key
+#
+#- block:
+#  - copy: content="{{ ec2_key.key.private_key }}" dest="{{ install_dir }}/data/{{ key_name }}" mode=0400
+#
+#  - debug: var=ansible_ssh_private_key_file
+#
+#  - copy: content="{{ ec2_key.key.private_key }}" dest="{{ ansible_ssh_private_key_file }}" mode=0400
+#
+#  - name: register private key
+#    uri:
+#      url: "{{ callback_url }}/config"
+#      method: PATCH
+#      body_format: json
+#      body:
+#        ssh_key: "{{ ec2_key.key.private_key }}"
+#        ssh_key_file: "{{install_dir}}/data/{{ key_name }}"
+#      status_code: 200
+#      user: "{{ callback_token }}"
+#      password: "X"
+#      validate_certs: no
+#
+#  when: ec2_key.changed
+
+#- name: get asg facts
+#  ec2_asg_facts:
+#    name: "{{ provider.config.auto_scaling_group }}"
+#    region: "{{ provider.config.aws_region }}"
+#  register: asg_facts
+#  when: ec2_key.changed
+
+- name: update launch config
+  aws_update_lc:
+    asg_name: "{{provider.config.auto_scaling_group}}"
+    disk_count: "{{provider.config.disk_count|default(0)}}"
+    disk_size: "{{provider.config.disk_size|default(0)}}"
+    disk_type: "{{provider.config.disk_type|default('')}}"
+    key_name: "{{provider.config.key_name}}"
+    aws_region: "{{provider.config.aws_region}}"
+    host_count: "{{host_count}}"
+    scale: "{{scale}}"
+    use_installer: "{{provider.config.use_installer|default(false)|bool}}"
+    use_ephemeral: "{{provider.config.use_ephemeral|default(false)|bool}}"
+  register: updated
+
+- set_fact:
+    processes: [ Terminate, AZRebalance, ReplaceUnhealthy, HealthCheck ]
+
+- set_fact:
+    processes: [ ]
+  when: "'debug' in cluster_name"
+
+- name: update asg
+  ec2_asg:
+    region: "{{ provider.config.aws_region }}"
+    name: "{{ provider.config.auto_scaling_group }}"
+    max_size: "{{updated.new_count}}"
+    min_size: "{{updated.new_count}}"
+    desired_capacity: "{{updated.new_count}}"
+    suspend_processes: "{{ processes }}"
+    validate_certs: False
+
+- ec2_instance_facts:
+    region: "{{ provider.config.aws_region }}"
+    filters:
+      "tag:aws:autoscaling:groupName": "{{ provider.config.auto_scaling_group }}"
+      "instance-state-name": "running"
+    validate_certs: False
+  register: ec2_instances
+
+- set_fact:
+    ips: "{{ ec2_instances.instances | map(attribute='private_dns_name') | list | difference(hosts) }}"
+
+- set_fact:
+    ips: "{{ ec2_instances.instances | map(attribute='public_dns_name') | list | difference(hosts) }}"
+  when: provider.config.use_public_ip|default(false)|bool
+
+- set_fact:
+    hosts: "{{ hosts }} + {{ ips }}"
+
+- mapr_state.py: state=16
+
+- name: wait for ssh access
+  wait_for:
+    host: "{{ item }}"
+    port: 22
+    delay: 2
+    sleep: 2
+    timeout: 300
+    active_connection_states:
+      - ESTABLISHED
+  with_items: "{{ ips }}"
+
+- block:
+  - uri:
+      url: http://169.254.169.254/latest/meta-data/instance-id
+      return_content: yes
+    register: installer_instance_id
+
+  - uri:
+      url: http://169.254.169.254/latest/meta-data/placement/availability-zone
+      return_content: yes
+    register: availability_zone
+
+  - uri:
+      url: http://169.254.169.254/latest/meta-data/local-hostname
+      return_content: yes
+    register: installer_ip
+
+  - set_fact:
+      ips: "{{ ips }} + [ '{{ installer_ip['content'] }}' ]"
+
+  - uri:
+      url: http://169.254.169.254/latest/meta-data/public-hostname
+      return_content: yes
+    register: installer_ip
+    when: provider.config.use_public_ip|default(false)|bool
+
+  - set_fact:
+      ips: "{{ ips }} + [ '{{ installer_ip['content'] }}' ]"
+    when: provider.config.use_public_ip|default(false)|bool
+
+  - aws_prep_installer:
+      disk_count: "{{provider.config.disk_count|default(0)}}"
+      disk_size: "{{provider.config.disk_size|default(0)}}"
+      disk_type: "{{provider.config.disk_type|default('')}}"
+      aws_region: "{{provider.config.aws_region}}"
+      instance_id: "{{installer_instance_id['content']}}"
+      availability_zone: "{{availability_zone['content']}}"
+
+  when: not scale|bool and provider.config.use_installer|default(false)|bool
+
+- mapr_state.py: state=17
+
+- add_host:
+    hostname: "{{ item }}"
+    groupname: "provisioned_ips"
+  with_items: "{{ ips }}"
+
+- mapr_state.py: state=18
+
+
+

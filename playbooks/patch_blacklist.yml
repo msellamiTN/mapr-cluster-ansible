@@ -1,0 +1,28 @@
+---
+- name: Initiating node blacklisting
+  hosts: all
+  max_fail_percentage: 0
+
+  environment:
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  tasks:
+  - name: Determining if node has TaskTracker role
+    stat: path="/opt/mapr/roles/tasktracker"
+    register: tasktrackerRole
+    check_mode: False
+
+  - name: Determining admin user
+    debug: msg="Administration user set to {{ mapr.admin_user }}"
+
+  - name: Determining Hadoop mode (YARN vs Classic)
+    check_hadoop_version.py: mapr_user='{{ cluster_admin_id }}' timeout={{timeout.standard}}
+    register: hadoop_mode
+    check_mode: False
+
+  - name: Blacklisting TaskTracker. New jobs will not be assigned to the node
+    shell: "/usr/bin/hadoop job -blacklist-tracker {{ansible_fqdn}}"
+    become: True
+    become_user: "{{ mapr.admin_user }}"
+    when: tasktrackerRole.stat.exists|bool == True and
+        hadoop_mode.default_mode == "classic"

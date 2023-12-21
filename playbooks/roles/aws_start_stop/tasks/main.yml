@@ -1,0 +1,36 @@
+# AWS Start-Stop nodes in the cluster
+# instance_state should be one of running or stopped
+
+- name: get cluster machines
+  ec2_instance_facts:
+    region: "{{ provider.config.aws_region }}"
+    filters:
+      "tag:aws:autoscaling:groupName": "{{ provider.config.auto_scaling_group }}"
+      "instance-state-name": "{{current_state}}"
+    validate_certs: False
+  register: ec2_instances
+
+- set_fact:
+    instances: "{{ ec2_instances.instances | map(attribute='id') | list }}"
+    num_hosts: "{{ ec2_instances.instances | length }}"
+    ips: "{{ ec2_instances.instances | map(attribute='private_ip_address') | list }}"
+
+- name: start/stop aws instances
+  ec2:
+    region: "{{ provider.config.aws_region }}"
+    state: "{{ instance_state | default('running') }}"
+    instance_ids: "{{ instances }}"
+    validate_certs: False
+    wait: yes
+  when: "num_hosts | int > 0"
+
+- name: wait for ssh access
+  wait_for:
+    host: "{{ item }}"
+    port: 22
+    delay: 2
+    sleep: 2
+    timeout: 300
+    active_connection_states:
+      - ESTABLISHED
+  with_items: "{{ ips }}"

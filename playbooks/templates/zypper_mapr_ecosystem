@@ -1,0 +1,5 @@
+[mapr_ecosystem]
+enabled=1
+autorefresh=1
+baseurl={{ repo_eco }}{{ repo_subdir }}
+gpgcheck=1

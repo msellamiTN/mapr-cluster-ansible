@@ -1,0 +1,276 @@
+---
+#
+# Playbook Name:: start_services
+#
+# Copyright 2013, MapR Technologies
+#
+#   Very simple operation ... start services configured on this node.
+#       Side Effect: enable them if cluster-conf file exists (proving
+#       successful configuration)
+#
+#   TODO : allow "tags" to start zookeeper on it's own rather than
+#   with the warden service.
+
+- name: "Starting DF services"
+  hosts: all
+  serial: "{{ forks }}"
+  vars:
+    maprConfConfd: "{{ mapr_home }}/conf/conf.d"
+    maprConfdBackup: "{{ maprConfConfd }}.sv.{{ ansible_date_time.epoch }}"
+    maprZkPidFile: "{{ mapr_home }}/zkdata/zookeeper_server.pid"
+    maprWardenPidFile: "{{ mapr_home }}/pid/warden.pid"
+    maprServerTicketFile: "{{ mapr_home }}/conf/maprserverticket"
+    maprloopbacknfsHome: "/usr/local/mapr-loopbacknfs"
+    loopbacknfsRoleFile: "{{ maprloopbacknfsHome }}/roles/loopbacknfs"
+    systemd_service_path: '/etc/systemd/system/'
+    loopbacknfs_initscript_path: "{{ maprloopbacknfsHome }}/initscripts/mapr-loopbacknfs"
+    loopbacknfs_systemd_service_path: "{{ systemd_service_path }}/mapr-loopbacknfs.service"
+    loopbacknfs_systemd_service_srcpath: "{{ maprloopbacknfsHome }}/initscripts/mapr-loopbacknfs.service"
+    loopbacknfs_systemd_service_srcpath_patch: "{{ mapr_home }}/installer/etc/systemd/mapr-loopbacknfs.service"
+    restartZK: False
+    restartWarden: False
+
+  environment:
+    MAPR_TICKETFILE_LOCATION: "{{mapr_home}}/conf/mapruserticket"
+
+  tasks:
+    - name: Determine MapR version
+      shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'"
+      check_mode: False
+      register: mapr_version_triple
+
+    - stat: path="{{ mapr_home }}/conf/mapr-clusters.conf"
+      check_mode: False
+      register: mapr_configured
+
+    - stat: path="{{ mapr_home }}/initscripts/mapr-warden"
+      check_mode: False
+      register: warden_present
+
+    - stat: path="{{ systemd_service_path }}/mapr-warden.service"
+      check_mode: False
+      register: warden_systemd_file_present
+
+    - stat: path="{{ mapr_home }}/roles/zookeeper"
+      check_mode: False
+      register: zookeeper_present
+
+    - stat: path="{{ loopbacknfsRoleFile }}"
+      check_mode: False
+      register: loopbacknfs_present
+
+    - stat: path="{{ loopbacknfs_systemd_service_path }}"
+      check_mode: False
+      register: loopbacknfs_systemd_service_file_installed
+
+    - stat: path="{{ maprWardenPidFile }}"
+      check_mode: False
+      register: warden_pid_file_present
+
+    - stat: path="{{ maprServerTicketFile }}"
+      check_mode: False
+      register: server_ticket_file_present
+
+    - stat: path="{{ maprZkPidFile }}"
+      check_mode: False
+      register: zookeeper_pid_file_present
+      when: zookeeper_present.stat.exists|bool == True
+
+    - stat: path="{{ loopbacknfs_systemd_service_path }}"
+      register: loopbacknfs_systemd_present
+      ignore_errors: True
+      check_mode: False
+
+    - block:
+
+        - stat:
+            path: "{{ loopbacknfs_initscript_path }}"
+          register: loopbacknfs_service_initscripts
+          ignore_errors: True
+
+        - copy:
+            src: "{{ loopbacknfs_initscript_path }}.new"
+            dest: "{{ loopbacknfs_initscript_path }}"
+          when: not loopbacknfs_service_initscripts.stat.exists
+
+        - stat:
+            path: "{{ loopbacknfs_systemd_service_srcpath }}"
+          register: loopbacknfs_service_file
+          ignore_errors: True
+
+        - copy:
+            src: "{{ loopbacknfs_systemd_service_srcpath_patch }}"
+            dest: "{{ loopbacknfs_systemd_service_srcpath }}"
+          when: not loopbacknfs_service_file.stat.exists
+
+      when: loopbacknfs_present.stat.exists|bool == True and not loopbacknfs_systemd_present.stat.exists and
+        ansible_service_mgr == "systemd" and ansible_os_family == 'Debian' and
+        (version == '6.0.1' or version == '6.1.0' or version == '6.1.1')
+
+    # setup loopbacknfs if required
+    - name: Setup mapr-loopbacknfs service
+      command: "cp {{ loopbacknfs_systemd_service_srcpath }} {{ loopbacknfs_systemd_service_path }}"
+      when: loopbacknfs_present.stat.exists|bool == True and ansible_os_family == 'Debian'
+
+    # patch loopbacknfs service file if required
+    - name: Patch mapr-loopbacknfs service
+      ansible.builtin.lineinfile:
+        dest: "{{ loopbacknfs_systemd_service_path }}"
+        line: 'Conflicts=nfs-mountd.service'
+        insertafter: 'After=network.target.*$'
+        state: present
+      when: loopbacknfs_present.stat.exists|bool == True
+
+    # remove loopbacknfs service if not required
+    - name: Remove mapr-loopbacknfs service
+      file:
+        path: "{{ loopbacknfs_systemd_service_path }}"
+        state: absent
+      when: loopbacknfs_present.stat.exists|bool == False and ansible_os_family == 'Debian'
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+      when: ansible_service_mgr  == "systemd"
+
+    - name: Make sure node is configured
+      fail: msg="configure.sh did not produce a mapr-clusters.conf file"
+      when: mapr_configured.stat.exists | bool == False
+
+    - name: Determine if we need to restart zk
+      set_fact: restartZK=True
+      when: zookeeper_present.stat.exists | bool == True and
+            zookeeper_pid_file_present.stat.exists | bool == True and
+            server_ticket_file_present.stat.exists | bool == True and
+            (zookeeper_pid_file_present.stat.mtime | int < server_ticket_file_present.stat.mtime | int)
+
+    - name: Force enable Zookeper on Ubuntu 16.04
+      command: systemctl enable mapr-zookeeper
+      when: mapr_configured.stat.exists | bool == True and
+            zookeeper_present.stat.exists | bool == True and restartZK == False and
+            ansible_distribution_version is version_compare('16.04', '==')
+
+    - name: Run and enable Zookeper
+      service:
+        name: mapr-zookeeper
+        enabled: yes
+        state: restarted
+      when: mapr_configured.stat.exists | bool == True and
+            zookeeper_present.stat.exists | bool == True and restartZK == False
+
+    - name: Restart Zookeper
+      service:
+        name: mapr-zookeeper
+        enabled: yes
+        state: restarted
+      when: mapr_configured.stat.exists | bool == True and restartZK == True
+
+    # copy file to detect if control hosts have changed
+    - file:
+        path: "{{ mapr_home }}/installer/data"
+        state: directory
+        owner: "{{ cluster_admin_id }}"
+        group: "{{ cluster_admin_group }}"
+      check_mode: False
+
+    - copy:
+        content: "ZK={{ ZOOKEEPER_HOSTS }};CLDB={{ CLDB_HOSTS }}"
+        dest: "{{ mapr_home }}/installer/data/clusters.conf"
+        owner: "{{ cluster_admin_id }}"
+        group: "{{ cluster_admin_group }}"
+      check_mode: False
+      register: clusters_file
+
+    - block:
+        # disable start of ecos during upgrade
+        # or if we changed security setting
+        # TODO Need to also add condition for MEP upgrade
+        - command: 'mv {{ maprConfConfd }} {{ maprConfdBackup }}'
+
+        - file: path='{{ maprConfConfd }}' state=directory
+
+        - command: 'cp {{ maprConfdBackup }}/warden.apiserver.conf {{ maprConfConfd }}'
+          ignore_errors: True
+
+        - command: 'cp {{ maprConfdBackup }}/warden.gateway.conf {{ maprConfConfd }}'
+          ignore_errors: True
+
+        - command: 'cp {{ maprConfdBackup }}/warden.historyserver.conf {{ maprConfConfd }}'
+          ignore_errors: True
+
+        - command: 'cp {{ maprConfdBackup }}/warden.httpfs.conf {{ maprConfConfd }}'
+          ignore_errors: True
+
+        - command: 'cp {{ maprConfdBackup }}/warden.nodemanager.conf {{ maprConfConfd }}'
+          ignore_errors: True
+
+        - command: 'cp {{ maprConfdBackup }}/warden.resourcemanager.conf {{ maprConfConfd }}'
+          ignore_errors: True
+
+        - command: 'cp {{ maprConfdBackup }}/warden.timelineserver.conf {{ maprConfConfd }}'
+          ignore_errors: True
+      when: (command == "upgrade" or command == "rolling_upgrade") and mapr_version_triple.stdout | int <= 610
+
+    - name: check if warden is running
+      command: "{{ mapr_home}}/initscripts/mapr-warden status"
+      ignore_errors: True
+      register: warden_status
+
+    - block:
+        - name: Get list of the ECO warden config files
+          find: paths="{{ maprConfConfd }}" patterns="warden.*.conf"
+          register: eco_warden_files_start
+
+        - debug: var=eco_warden_files_start
+
+        - name: Disable Eco services(start_services)
+          command: "maprcli node services -name {{ item.path|regex_replace('.*warden\\.(.*)\\.conf','\\1') }} -action disable -nodes {{ ansible_nodename }}"
+          ignore_errors: True
+          with_items: "{{ eco_warden_files_start.files }}"
+          when: eco_warden_files_start is succeeded and eco_warden_files_start.files
+          register: eco_warden_files_disabled
+
+        - debug: msg="WARNING:\ Some ecosystems failed to disable, which means an additional restart may be needed after install for those"
+          when: eco_warden_files_disabled is failed
+
+        - debug: var=eco_warden_files_disabled
+
+      when: mapr_version_triple.stdout | int >= 610 and not (command == "update" or command == "scale" or command == "rolling_upgrade" or
+            is_fresh_install) and mep_upgrade and warden_status is succeeded
+
+    # Before starting warden, wait for ZK service to be alive.
+    # This is mostly an error check, since starting warden
+    # without ZK leads to strange errors.
+    #
+    - action: "wait_for_zk_service.sh MAX_WAIT=300 ZK_NODES={{ mapr.groups.zk|join(',') }}"
+      when: mapr_configured.stat.exists|bool == True and warden_present.stat.exists|bool == True
+
+    - name: Determine if we need to restart warden
+      set_fact: restartWarden=True
+      when: warden_present.stat.exists|bool == True and
+        warden_pid_file_present.stat.exists|bool == True and
+        server_ticket_file_present.stat.exists|bool == True and
+        (warden_pid_file_present.stat.mtime|int <
+        server_ticket_file_present.stat.mtime|int)
+
+    - name: make sure warden.conf is owned by cluster_admin
+      file:
+        path: "{{ mapr_home }}/conf/warden.conf"
+        group: "{{ cluster_admin_group }}"
+        owner: "{{ cluster_admin_id }}"
+
+    - name: Warden running and enabled.
+      service:
+        name: mapr-warden
+        enabled: yes
+        state: started
+      when: warden_present.stat.exists|bool == True and not clusters_file.changed and not restartWarden
+
+    - name: Restarting warden because config changed.
+      service:
+        name: mapr-warden
+        enabled: yes
+        state: restarted
+      when: (warden_present.stat.exists|bool == True and (clusters_file.changed or restartWarden)) or (command == "upgrade" or command == "rolling_upgrade")
+
+    - mapr_state.py: state=14

@@ -1,0 +1,318 @@
+---
+#
+# Playbook Name:: stage2
+#
+# Copyright 2017, MapR Technologies
+#
+
+- name: Configuring second stage files
+  hosts: all
+  vars:
+    nfs_activated: "{{ mapr.node.global_nfs_enabled }}"
+    nfs_exist_deb: false
+    nfs_exist_rpm: false
+    retry_delay: 5
+    retry_count: 120
+    wait_seconds: 60
+    maprloopbacknfsHome: "/usr/local/mapr-loopbacknfs"
+    loopbacknfsRoleFile: "{{ maprloopbacknfsHome }}/roles/loopbacknfs"
+    MAPR_CLI: "sudo -E -n -u {{ cluster_admin_id }} {{ mapr_home }}/bin/maprcli"
+    security: "{{ mapr.node.security|default('disabled') }}"
+    esSecurity: "{{ mapr.node.es_security|default('disabled') }}"
+    diskEncryption: "{% if enable_encryption_at_rest|default(False) %}1{% else %}0{% endif %}"
+    maprConfConfd: "{{ mapr_home }}/conf/conf.d"
+    mepUpgrade: "{{ mep_upgrade|default(false) }}"
+    meteringMinConfig: "{% if enable_min_metrics_collection|default(False) %}1{% else %}0{% endif %}"
+    last_cldb_node: "{{ mapr.groups.cldb | last }}"
+    configureSSOKeycloak: "{% if sso_keycloak|default(False) %}1{% else %}0{% endif %}"
+
+  environment:
+    MAPR_TICKETFILE_LOCATION: "{{mapr_home}}/conf/mapruserticket"
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  tasks:
+    - name: "Check for mapr-nfs package on RPM based"
+      shell: rpm -qa | grep mapr-nfs
+      check_mode: False
+      register: nfs_exist_rpm_sh
+      ignore_errors: True
+      when: ansible_os_family == 'RedHat' or ansible_os_family == 'Suse'
+
+    - stat: path="{{ loopbacknfsRoleFile }}"
+      check_mode: False
+      register: loopbacknfs_present
+
+    - set_fact:
+        nfs_exist_rpm: true
+      when: (ansible_os_family == 'RedHat' or ansible_os_family == 'Suse') and nfs_exist_rpm_sh.rc == 0
+
+    - name: "Check for mapr-nfs package DEB based"
+      command: dpkg -s mapr-nfs
+      check_mode: False
+      register: nfs_exist_deb_sh
+      ignore_errors: True
+      when: ansible_os_family == 'Debian'
+
+    - set_fact:
+        nfs_exist_deb: true
+      when: ansible_os_family == 'Debian' and nfs_exist_deb_sh.rc == 0
+
+    - name: Determine MapR version
+      shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'"
+      check_mode: False
+      register: mapr_version_triple
+
+    - name: "Group by OS family"
+      group_by: key={{ ansible_os_family }}
+
+    - mapr_stage2.py:
+        data='{{ mapr.node|to_json }}'
+        mapr_home='{{ mapr_home }}'
+        command='{{ command }}'
+        template_dir=/tmp/installer/services/templates timeout={{timeout.standard}}
+      when: command != "update"
+
+    - file: path="{{ mapr_home }}/roles/drill-qs" state=absent
+      ignore_errors: True
+      when: mapr_db == "DRILL" or mapr_db == "DRILLQS"
+
+    - name: Execute do_configure from 'stage2.yml'
+      do_configure.sh:
+        MAPR_HOME={{ mapr_home }}
+        MAPR_USER={{ cluster_admin_id }}
+        MAPR_GROUP={{ cluster_admin_group }}
+        CLUSTERNAME={{ cluster_name }}
+        CLDBNODES={{ mapr.groups.cldb|join(',') }}
+        ZKNODES={{ mapr.groups.zk|join(',') }}
+        HISTORYSERVER_HOST={{ HISTORYSERVER_HOST|default('') }}
+        TIMELINESERVER_HOST={{ TIMELINESERVER_HOST|default('') }}
+        HMNODES={{ HIVEMETASTORE_HOSTS|default('') }}
+        ESNODES={{ ELASTICSEARCH_HOSTS|default('') }}
+        ES_DB={{ elasticsearch_path|default('') }}
+        ES_PW={{ log_admin_password|default('') }}
+        NORECALC="{% if patch_file is defined and patch_file|length > 0 %}1{% else %}0{% endif %}"
+        GRAFANA_PW="{% if security == 'disabled' %}{{ metrics_ui_admin_password|default('') }}{% else %}{{ cluster_admin_password }}{% endif %}"
+        MAPRDB={{ mapr_db }}
+        METRICS_DATABASE_HOST={{ mapr.node.db.metrics_db_host }}
+        METRICS_DATABASE_PORT={{ mapr.node.db.metrics_db_port }}
+        METRICS_DATABASE_USER={{ mapr.node.db.metrics_db_user }}
+        METRICS_DATABASE_PASSWORD={{ mapr.node.db.metrics_db_password }}
+        METRICS_DATABASE_NAME={{ mapr.node.db.metrics_db_name }}
+        OTNODES={{ OPENTSDB_HOSTS|default('') }}
+        DARE={{ diskEncryption }}
+        SSO_KEYCLOAK={{ configureSSOKeycloak }}
+        METERING_CONFIG_ONLY={{ meteringMinConfig }}
+        SECURITY={{ security }}
+        YARN={{ True }}
+        LICENSE_MODULES={{ license_modules|join(',') }}
+        LICENSE_TYPE={{ license_type }}
+        RESTART_ECO=0
+        REFRESH_ROLES=1
+        TIMEOUT_CONFIGURE={{timeout.configure}}
+        TIMEOUT_MAPRCLI={{timeout.standard}}
+      when: command != "update"
+      register: do_configure_result
+
+    - set_fact: configure_log="{{ do_configure_result.mapr_logs | regex_search(cfg_log_regexp,'\\3') }}"
+      when: do_configure_result.mapr_logs is defined
+     
+    - debug: var=do_configure_result.mapr_logs
+    - debug: var=configure_log
+    - debug: var=configure_log[0]
+
+    - fetch: src='{{ configure_log[0] }}' dest='{{log_dir}}/{{ ansible_nodename }}_{{ configure_log[0].split('/')[-1] }}' flat=yes validate_checksum=no
+      when: configure_log is defined and configure_log|length > 0
+      register: configure_log_fetched
+
+    - file: path="{{ configure_log[0] }}" state=absent
+      when: configure_log_fetched is succeeded and configure_log_fetched is not skipped
+
+    - name: "Store cluster ID"
+      action: "mapr_cluster.py"
+      run_once: true
+      when: command != "upgrade" and command != "update" and command != "rolling_upgrade"
+
+    - name: "check if warden is under systemd"
+      shell: systemctl 2>&1 | fgrep -q '.mount'
+      ignore_errors: True
+      register: systemd_in_use
+
+    - debug: var=systemd_in_use
+      when: systemd_in_use is failed
+
+    - name: make sure warden.conf is owned by cluster_admin
+      file: path="{{ mapr_home }}/conf/warden.conf" group="{{ cluster_admin_group }}" owner="{{ cluster_admin_id }}"
+
+    - name: "Reload Warden on mep upgrade as warden files changed"
+      service: name=mapr-warden enabled=yes state=reloaded
+      when: systemd_in_use is failed and (mepUpgrade or (command is defined and (command == "upgrade" or command == "rolling_upgrade")))
+
+    - block:
+      - name: "Find any ECOs that we disabled during upgrade"
+        shell: "grep -l 'service.runstate=disabled' {{ maprConfConfd }}/*"
+        register: disabled_ecos
+        ignore_errors: True
+
+      - debug: var=disabled_ecos
+
+      - name: "Reenable disabled ECOs"
+        shell: "{{ MAPR_CLI }} node services -name {{ item|regex_replace('.*warden\\.(.*)\\.conf','\\1') }} -action enable -nodes {{ ansible_nodename }} && sleep 5"
+        ignore_errors: True
+        with_items: "{{ disabled_ecos.stdout_lines }}"
+        when: disabled_ecos is succeeded and
+              (command == "upgrade" or command == "rolling_upgrade" or mepUpgrade or changingSecuritySetting)
+        register: disabled_ecos_enabled
+
+      - name: "workaround intermittent enable issue"
+        ansible.builtin.lineinfile: path={{ item.item }} line='service.runstate=disabled' state=absent
+        with_items: "{{ disabled_ecos_enabled.results }}"
+        when: disabled_ecos_enabled is failed and disabled_ecos_enabled.results is defined and
+              (command == "upgrade" or command == "rolling_upgrade" or mepUpgrade or changingSecuritySetting)
+        register: forced_enable
+
+      - debug: var=forced_enable
+
+      - debug: var=disabled_ecos_enabled
+
+      - name: "Check to see if we have upgraded services that overwrote the warden conffile"
+        shell: "{{ MAPR_CLI }} service list -node {{ ansible_nodename }} -output terse | awk '{if ($1 == 5) { if (NF == 5) { print $5 } else { print $4}}}'"
+        ignore_errors: True
+        when: disabled_ecos is succeeded and
+              (command == "upgrade" or command == "rolling_upgrade" or mepUpgrade or changingSecuritySetting)
+        register: potentially_disabled_services
+
+      - name: "Enable missed ones because of overwritten warden conffiles wihtout disable state"
+        command: "{{ MAPR_CLI }} node services -action enable -name {{ item }} -nodes {{ ansible_nodename }}"
+        with_items: "{{ potentially_disabled_services.stdout_lines }}"
+        ignore_errors: True
+        when: potentially_disabled_services is succeeded and potentially_disabled_services.stdout_lines|length > 0
+        register: enabled_missed_services
+
+      - debug: var=enabled_missed_services
+
+      - debug: msg="WARNING:\ Some ecosystems failed to be enabled, which means an additional restart may be needed after install for those"
+        when: disabled_ecos_enabled is failed
+
+      when: mapr_version_triple.stdout | int >= 610
+
+    - name: "Determine MapR version"
+      shell: cat /opt/mapr/MapRBuildVersion
+      check_mode: False
+      register: mapr_version
+
+    - name: "Set the new cluster version"
+      command: "{{ MAPR_CLI }} config save -values \"{mapr.targetversion: {{mapr_version.stdout}} }\""
+      ignore_errors: True
+      run_once: True
+      when: command == "upgrade" or command == "update"
+
+    - name: "Enable all new features"
+      command: "{{ MAPR_CLI }} cluster feature enable -all"
+      ignore_errors: True
+      run_once: True
+      when: command == "upgrade" or command == "update"
+
+    - name: "Find all installed ecosystems"
+      find: paths={{ maprConfConfd }} patterns="warden.*.conf"
+      register: warden_conf_files
+
+    - name: "Restart ECOs during incremental"
+      command: "{{ MAPR_CLI }} node services -name {{ item.path|regex_replace('.*warden\\.(.*)\\.conf', '\\1') }} -action restart -nodes {{ ansible_nodename }}"
+      with_items: "{{ warden_conf_files.files }}"
+      ignore_errors: True
+      when: changingSecuritySetting and warden_conf_files is succeeded and not is_fresh_install and
+            mapr_version_triple.stdout | int < 610
+      register: restarting_ecos
+
+    - debug: var=restarting_ecos
+      when: restarting_ecos is failed
+
+    # Enable QS if QS only or QS+DRILL is configured, but not for Drill only
+    - name: "Enable QS"
+      command: "{{ MAPR_CLI }} cluster queryservice setconfig -enabled True -clusterid {{ cluster_name }}-drillbits -storageplugin dfs -znode /drill"
+      ignore_errors: True
+      run_once: True
+      when: mapr_db == "QS" or mapr_db == "DRILLQS"
+
+    - shell: "{{ MAPR_CLI }} cluster gateway set -dstcluster {{cluster_name }} -gateways localhost"
+      run_once: True
+      when: mapr_db == 'QSLITE'
+
+    - block:
+      - name: "Remove the node from maintenance mode"
+        shell: "{{ MAPR_CLI }} node maintenance -timeoutminutes 0 -nodes {{ ansible_nodename }}"
+        run_once: True
+        ignore_errors: True
+        register: remove_maintenance
+
+      - debug: var=remove_maintenance
+        when: remove_maintenance is failed
+      
+      - name: "Notify the CLDB that the upgrade is complete on the node"
+        shell: "{{ MAPR_CLI }} notifyupgrade finish -node {{ ansible_nodename }}"
+        run_once: True
+        ignore_errors: True
+      when: command is defined and command == "rolling_upgrade"
+
+    - import_tasks: bounce_warden.yml
+      when: command == 'upgrade' or command == 'rolling_upgrade' or command == 'scale' or is_fresh_install or mapr.node.installed|bool == False
+
+    - block:
+      - name: "Pause for {{ wait_seconds | int }} second(s) for services to start"
+        ansible.builtin.pause:
+          seconds: "{{ wait_seconds | int }}"
+
+      - name: Wait for local containers to resync
+        wait_for_resync.sh:
+          MAPR_HOME: "{{ mapr_home }}"
+          TIMEOUT_MRCONFIG: "{{ timeout.standard | int + 60 }}"
+        register: resync_local_containers
+        retries: "{{ retry_count }}"
+        until: resync_local_containers is not failed
+        ignore_errors: True
+        delay: "{{ retry_delay }}"
+      
+      - debug: var=resync_local_containers
+
+      when: command is defined and command == "rolling_upgrade"
+
+    # Run the upgrade finalizing commands only on the last CLDB node
+    - block:
+      - name: "Set the new cluster version"
+        command: "{{ MAPR_CLI }} config save -values \"{mapr.targetversion: {{mapr_version.stdout}} }\""
+        ignore_errors: True
+        run_once: True
+      
+      - name: "Enable all new features"
+        command: "{{ MAPR_CLI }} cluster feature enable -all"
+        ignore_errors: True
+        run_once: True
+
+      when: command == "rolling_upgrade" and  inventory_hostname == last_cldb_node and failed_nodes is not defined
+
+    - name: make sure loopbacknfs is running if warden got bounced
+      service: name=mapr-loopbacknfs enabled=yes state=started
+      when: loopbacknfs_present.stat.exists|bool == True
+
+    - name: "Check /mapr is mounted"
+      shell: df | grep /mapr
+      async: 30
+      poll: 5
+      register: mapr_mounted
+      ignore_errors: True
+
+    - name: "Run script to fix NFS mount"
+      command: "{{ mapr_home }}/bin/mount_local_fs.pl"
+      ignore_errors: True
+      when: command == 'install' and nfs_activated and (nfs_exist_deb or nfs_exist_rpm) and not is_fresh_install and mapr_mounted.rc == 1
+
+    - name: Mount /mapr
+      command: "mount -o soft,intr,nolock localhost:/mapr /mapr"
+      retries: "{{ retry_count }}"
+      delay: "{{ retry_delay }}"
+      register: mount_mapr
+      until: mount_mapr is not failed
+      when: loopbacknfs_present.stat.exists|bool == True and mapr_mounted.rc == 1
+
+# run custom playbook if available and enabled
+- import_playbook: postinstall.yml

@@ -1,0 +1,626 @@
+---
+#
+# Playbook Name:: configure
+#
+# Copyright 2013, MapR Technologies
+#
+#   Very simple implementation.   Calls MapR configure.sh utility
+#   with specifications from the environment.
+#
+
+- name: Configuring MapR services
+  hosts: all
+  serial: "{{ forks }}"
+  gather_facts: True
+
+  environment:
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  vars:
+    maprloopbacknfsHome: "/usr/local/mapr-loopbacknfs"
+    maprloopbacknfsConf: "{{ maprloopbacknfsHome }}/conf"
+    loopbacknfsEnvFile: "{{ maprloopbacknfsConf }}/env.sh"
+    maprConf: "{{ mapr_home }}/conf"
+    maprLoginConf: "{{ maprConf }}/mapr.login.conf"
+    hsmConfFile: "maprhsm.conf"
+    newMaprLoginConf: "{{ maprConf }}.new/mapr.login.conf"
+    cConfFile: "{{ maprConf }}/mapr-clusters.conf"
+    loopbacknfscConfFile: "{{ maprloopbacknfsConf }}/mapr-clusters.conf"
+    maprFstabFile: "{{ maprConf }}/mapr_fstab"
+    loopbacknfsFstabFile: "{{ maprloopbacknfsConf }}/mapr_fstab"
+    envOverrideFile: "{{ maprConf }}/env_override.sh"
+    cldbNodes: "{{ mapr.groups.cldb }}"
+    nfsRoleFile: "{{ mapr_home }}/roles/nfs"
+    nfs4RoleFile: "{{ mapr_home }}/roles/nfs4"
+    loopbacknfsRoleFile: "{{ maprloopbacknfsHome }}/roles/loopbacknfs"
+    isUpdate: "{{ is_update | default(false) }}"
+    inst_tmp: "{{ mapr_home }}/installer/data/tmp"
+    tokensTarBall: "tokens.tgz"
+    mapr_ca_cert_dir: "{{ maprConf }}/ca"
+    user_ticket_file: "{{ maprConf }}/mapruserticket"
+    security: "{{ mapr.node.security|default('disabled') }}"
+    diskEncryption: "{% if enable_encryption_at_rest|default(False) %}1{% else %}0{% endif %}"
+    meteringMinConfig: "{% if enable_min_metrics_collection|default(False) %}1{% else %}0{% endif %}"
+    wConfFile: "{{ maprConf }}/warden.conf"
+    wOverCommitLimit: 65536
+    externalPattern: "(^.*)({{ ansible_nodename }}):((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))($|,.*$)"
+    zkNodes: "{{ mapr.groups.zk }}"
+    numExistingCldbs: 0
+    numExistingZks: 0
+    controlGroupChanged: False
+    configureSSOKeycloak: "{% if sso_keycloak|default(False) %}1{% else %}0{% endif %}"
+
+  tasks:
+  - name: Determine MapR version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'"
+    check_mode: False
+    register: mapr_version_triple
+
+  - name: Check if mapr-clusters.conf exists
+    stat: path="{{ cConfFile }}"
+    register: cluster_conf
+    check_mode: False
+
+  - name: Check if warden.conf exists
+    stat: path="{{ wConfFile }}"
+    register: warden_conf
+    check_mode: False
+
+  - name: get 4 digit version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3$4}'"
+    register: mapr_build_version
+
+  - set_fact: mapr_version_quadruple={{ mapr_build_version.stdout }}
+
+  - name: Check if ssl_truststore.pem exists
+    stat: path="{{ maprConf }}/ssl_truststore.pem"
+    register: truststore_pem
+    check_mode: False
+
+  - name: Check if ssl_truststore.p12 exists
+    stat: path="{{ maprConf }}/ssl_truststore.p12"
+    register: truststore_p12
+    check_mode: False
+
+  - name: Check if ssl_keystore.p12 exists
+    stat: path="{{ maprConf }}/ssl_keystore.p12"
+    register: keystore_p12
+    check_mode: False
+
+  - name: Check if ssl_keystore.pem exists
+    stat: path="{{ maprConf }}/ssl_keystore.pem"
+    register: keystore_pem
+    check_mode: False
+
+  - name: Check if env_override.sh exists
+    stat: path="{{ envOverrideFile }}"
+    register: env_override_file
+    check_mode: False
+
+  - name: Add MAPR_SUBNETS to env_override.sh
+    ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_SUBNETS=' line="export MAPR_SUBNETS={{ mapr_subnet }}"
+    when: mapr_subnet is defined
+
+  - name: Remove MAPR_SUBNETS from env_override.sh
+    ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_SUBNETS=' line=""
+    when: mapr_subnet is not defined and env_override_file.stat.exists
+
+  - name: Add MAPR_RDMA_SUPPORT to env_override.sh
+    ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_RDMA_SUPPORT=' line="export MAPR_RDMA_SUPPORT=false"
+    when: mapr_version_quadruple|int >= 6200 and mapr_version_quadruple|int < 6202
+
+  - name: Remove MAPR_RDMA_SUPPORT from env_override.sh
+    ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_RDMA_SUPPORT=' line=""
+    when: (mapr_version_quadruple|int < 6200 or mapr_version_quadruple|int >= 6202)and env_override_file.stat.exists
+
+  - debug: var=externalPattern
+
+  - debug: var=mapr_external
+    when: mapr_external is defined
+
+  - name: Find my MAPR_EXTERNAL address
+    set_fact: my_mapr_external="{{ mapr_external | regex_replace(externalPattern,'\\3') }}"
+    when: mapr_external is defined
+
+  - debug: var=my_mapr_external
+
+  - name: Add MAPR_EXTERNAL to env_override.sh
+    ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_EXTERNAL=' line="export MAPR_EXTERNAL={{ my_mapr_external }}"
+    when: mapr_external is defined and my_mapr_external is defined and my_mapr_external != mapr_external
+
+  - name: Remove MAPR_EXTERNAL from env_override.sh
+    ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_EXTERNAL=' line=""
+    when: mapr_external is not defined and env_override_file.stat.exists
+
+  - name: remember number of configured ZKs
+    set_fact: numZks="{{ zkNodes|length }}"
+
+  - name: remember number of configured CLDBs
+    set_fact: numCldbs="{{ cldbNodes|length }}"
+
+  - block:
+    - name: compute number of existing ZKs
+      shell: "fgrep zookeeper {{ wConfFile }} | cut -d= -f2 | tr ',' '\n' | wc -l"
+      register: existingZks
+
+    - set_fact: numExistingZks="{{ existingZks.stdout }}"
+
+    - name: figure out if this node already had ZK configured
+      shell: "fgrep zookeeper {{ wConfFile }} | fgrep {{ ansible_nodename }}"
+      ignore_errors: True
+      register: existingZkOnMyNode
+
+    when:  warden_conf.stat.exists
+
+  - block:
+      - name: compute number of existing CLDBs
+        shell: "cat {{ cConfFile }} | head -n 1 | cut --complement -d' ' -f1 |
+             sed -e 's/[a-zA-Z]*=[a-zA-Z]* //g;s/[a-zA-Z]*=[0-9]* //g' |
+             tr ' ' '\n' | wc -l"
+        register: existingCldbs
+
+      - set_fact: numExistingCldbs="{{ existingCldbs.stdout }}"
+
+      - name: figure out if this node already had CLDB configured
+        shell: "cat {{ cConfFile }} | head -n 1 | grep {{ ansible_nodename }}"
+        ignore_errors: True
+        register: existingCldbOnMyNode
+
+    when:  cluster_conf.stat.exists
+
+  - name: determine if controlGroup changed
+    set_fact: controlGroupChanged=True
+    when: cluster_conf.stat.exists and (numExistingCldbs != numCldbs or numExistingZks != numZks)
+
+  - debug: msg="CLDB- {{ cldbNodes }}   ZK- {{ zkNodes }}"
+
+  # enable overcommit for warden to allow services to start on low mem machines
+  - ansible.builtin.lineinfile:
+        dest="{{ wConfFile }}"
+        line="enable.overcommit=true"
+        state=present
+    when: warden_conf.stat.exists|bool == True and ansible_memtotal_mb < wOverCommitLimit
+
+  - debug: var=mapr_version_triple
+
+  # Retrieve security credentials from controller
+  - block:
+    - block:
+      - name: Copying cldb.key
+        copy: src='{{inst_tmp}}/cldb.key' dest={{ maprConf }} mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        when: (inventory_hostname in zkNodes or inventory_hostname in cldbNodes)
+        register: cp_cldb
+
+      - name: Copying dare.master.key
+        copy: src='{{inst_tmp}}/dare.master.key' dest='{{ maprConf }}' mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        when: diskEncryption|int == 1
+        register: cp_dare
+      when: mapr_version_triple.stdout | int < 700
+
+    - block:
+      - name: create tokens directory
+        file: name="{{ maprConf }}/tokens" state=directory
+        register: create_tokens_dir
+
+      - name: fetch tokens tarball
+        copy: src="{{ inst_tmp }}/{{ tokensTarBall }}" dest=/tmp
+        register: retrieve_tokens
+
+      - name: extraxt tokens
+        unarchive: src='{{inst_tmp}}/{{ tokensTarBall }}' dest="{{ maprConf }}/tokens"
+        register: extract_tokens
+
+      - name: fetch hms config file
+        copy: src="{{ inst_tmp }}/{{ hsmConfFile }}" dest='{{ maprConf }}' mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: retrieve_hsm_conf_file
+      when: (inventory_hostname in zkNodes or inventory_hostname in cldbNodes) and
+             mapr_version_triple.stdout | int >= 700
+
+    - block:
+      - name: Copying ssl_truststore
+        copy: src='{{inst_tmp}}/ssl_truststore' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_trststr
+  
+      - name: Copying ssl_truststore.p12
+        copy: src='{{inst_tmp}}/ssl_truststore.p12' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_truststrp12
+        when: mapr_version_triple.stdout | int >= 610
+
+      - name: Copying maprtrustcreds.jceks
+        copy: src='{{inst_tmp}}/maprtrustcreds.jceks' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_trustcredsjceks
+        when:  mapr_version_triple.stdout | int >= 700
+
+      - name: Copying maprtrustcreds.conf
+        copy: src='{{inst_tmp}}/maprtrustcreds.conf' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_trustcredsconf
+        when:  mapr_version_triple.stdout | int >= 700
+
+      when: ansible_fips|bool == False
+
+    - block:
+      - name: Copying ssl_truststore.bcfks
+        copy: src='{{inst_tmp}}/ssl_truststore.bcfks' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_truststrbcfks
+
+      - name: Copying maprtrustcreds.bcfks
+        copy: src='{{inst_tmp}}/maprtrustcreds.bcfks' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_trustcredsbcfks
+
+      - name: Copying maprtrustcreds.conf
+        copy: src='{{inst_tmp}}/maprtrustcreds.conf' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_trustcredsconf
+
+      - name: creating symlink to ssl_truststore
+        file: src='{{maprConf}}/ssl_truststore.bcfks' dest={{ maprConf }}/ssl_trusstore  state=link mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: lnk_truststr
+      when: ansible_fips | bool == True and mapr_version_triple.stdout | int >= 700
+
+    - name: Copying ssl_truststore.pem
+      copy: src='{{inst_tmp}}/ssl_truststore.pem' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_trststrpem
+      when: mapr_version_triple.stdout | int >= 601
+
+    - block:
+      - name: Copying ssl_keystore
+        copy: src='{{inst_tmp}}/ssl_keystore' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keystr
+
+      - name: Copying maprkeycreds.jceks
+        copy: src='{{inst_tmp}}/maprkeycreds.jceks' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keycredsjceks
+        when: mapr_version_triple.stdout | int >= 700
+
+      - name: Copying maprkeycreds.conf
+        copy: src='{{inst_tmp}}/maprkeycreds.conf' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keycredsconf
+        when: mapr_version_triple.stdout | int >= 700
+
+      - name: Copying ssl_keystore.p12
+        copy: src='{{inst_tmp}}/ssl_keystore.p12' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keystrp12
+        when: mapr_version_triple.stdout | int >= 610
+      when: ansible_fips|bool == False
+
+    - block:
+      - name: Copying ssl_keystore.bcfks
+        copy: src='{{inst_tmp}}/ssl_keystore.bcfks' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keystrbcfks
+
+      - name: Copying maprkeycreds.bcfks
+        copy: src='{{inst_tmp}}/maprkeycreds.bcfks' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keycredsbcfks
+
+      - name: Copying maprkeycreds.conf
+        copy: src='{{inst_tmp}}/maprkeycreds.conf' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keycredsconf
+
+      - name: creating symlink to ssl_truststore
+        file: src='{{maprConf}}/ssl_keystore.bcfks' dest={{ maprConf }}/ssl_trusstore  state=link mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: lnk_keystr
+      when: ansible_fips|bool == True and mapr_version_triple.stdout | int >= 700
+
+    - block:
+      - name: Copying ssl_keystore.pem
+        copy: src='{{inst_tmp}}/ssl_keystore.pem' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_keystrpem
+      when: mapr_version_triple.stdout | int >= 610
+
+    - block:
+      - name: Copying private.key
+        copy: src='{{inst_tmp}}/private.key' dest={{ maprConf }} mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_privatekey
+
+      - name: Copying public.crt
+        copy: src='{{inst_tmp}}/public.crt' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_publiccrt
+      when: mapr_version_triple.stdout | int == 700
+
+    - name: Copying {{ item }}
+      copy: src='{{inst_tmp}}/{{ item }}' dest={{ maprConf }} mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      with_items:
+        - maprserverticket
+      register: cp_tkt
+
+    when: (is_fresh_install or mapr.node.installed|bool == False or changingSecuritySettingMT or command == "scale") and security == 'enabled'
+
+  - block:
+    - file: path="{{ mapr_ca_cert_dir }}" state=directory group="{{ cluster_admin_id }}" owner="{{ cluster_admin_group }}"
+
+    - name: Copying ssl_truststore
+      copy: src='{{inst_tmp}}/ssl_truststore' dest={{ maprConf }}  mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_truststore
+      when: ansible_fips|bool == False
+
+    - name: Copying ssl_truststore.p12
+      copy: src='{{inst_tmp}}/ssl_truststore.p12' dest={{ maprConf }}  mode=0644 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_usertruststorep12
+
+    - name: Copying ssl_truststore.pem
+      copy: src='{{inst_tmp}}/ssl_truststore.pem' dest={{ maprConf }}  mode=0644 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_truststorepem
+
+    - name: Copying ssl_keystore.csr
+      copy: src='{{inst_tmp}}/ssl_keystore.csr' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_keystorecsr
+      when: ansible_fips|bool == False
+
+    - name: Copying ssl_keystore-signed.pem
+      copy: src='{{inst_tmp}}/ssl_keystore-signed.pem' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_keystoresignedpem
+      when: is_fresh_install
+
+    - name: Copying root-ca.pem
+      copy: src='{{inst_tmp}}/root-ca.pem' dest={{ mapr_ca_cert_dir }}  mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_rootcapem
+
+    - name: Copying chain-ca.pem
+      copy: src='{{inst_tmp}}/chain-ca.pem' dest={{ mapr_ca_cert_dir }}  mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_rootcapem
+
+    - name: Copying signing-ca.pem
+      copy: src='{{inst_tmp}}/signing-ca.pem' dest={{ mapr_ca_cert_dir }}  mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_rootcapem
+
+    - name: Copying ssl_userkeystore
+      copy: src='{{inst_tmp}}/ssl_userkeystore' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_userkeystore
+      when: ansible_fips|bool == False
+
+    - name: Copying ssl_userkeystore.csr
+      copy: src='{{inst_tmp}}/ssl_userkeystore.csr' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_userkeystorecsr
+      when: ansible_fips|bool == False
+
+    - name: Copying ssl_userkeystore.p12
+      copy: src='{{inst_tmp}}/ssl_userkeystore.p12' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_userkeystorep12
+
+    - name: Copying ssl_userkeystore.pem
+      copy: src='{{inst_tmp}}/ssl_userkeystore.pem' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_userkeystorepem
+
+    - name: Copying ssl_userkeystore-signed.pem
+      copy: src='{{inst_tmp}}/ssl_userkeystore-signed.pem' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_userkeystoresignedpem
+
+    - name: Copying ssl_usertruststore
+      copy: src='{{inst_tmp}}/ssl_usertruststore' dest={{ maprConf }}  mode=0644 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_usertruststore
+      when: ansible_fips|bool == False
+
+    - name: Copying ssl_usertruststore.p12
+      copy: src='{{inst_tmp}}/ssl_usertruststore.p12' dest={{ maprConf }}  mode=0644 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_usertruststorep12
+
+    - name: Copying ssl_usertruststore.pem
+      copy: src='{{inst_tmp}}/ssl_usertruststore.pem' dest={{ maprConf }}  mode=0644 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_ssl_usertruststorepem
+
+    - block:
+      - name: Copying private.key
+        copy: src='{{inst_tmp}}/private.key' dest={{ maprConf }}  mode=0400 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_private_key
+
+      - name: Copying public.crt
+        copy: src='{{inst_tmp}}/public.crt' dest={{ maprConf }}  mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+        register: cp_public_crt
+      when:  mapr_version_triple.stdout | int == 700
+
+    - name: Get Hadoop version
+      command: "cat {{ mapr_home }}/hadoop/hadoopversion"
+      register: hadoop_version
+
+    - name: Copying ssl-client.xml
+      copy:
+        src: '{{inst_tmp}}/ssl-client.xml'
+        dest: '{{ mapr_home }}/hadoop/hadoop-{{hadoop_version.stdout}}/etc/hadoop'
+        mode: 0644
+        owner: '{{ cluster_admin_id }}'
+        group: '{{ cluster_admin_group }}'
+      register: cp_sslclientxml
+
+    - name: Copying ssl-server.xml
+      copy: src='{{inst_tmp}}/ssl-server.xml' dest={{ mapr_home }}/hadoop/hadoop-{{hadoop_version.stdout}}/etc/hadoop  mode=0640 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_sslserverxml
+
+    when: mapr_version_triple.stdout | int >= 620 and
+          (is_fresh_install or mapr.node.installed|bool == False or changingSecuritySettingMT or command == "scale" or command == "upgrade" or command == "rolling_upgrade") and security == 'enabled'
+
+
+    # on an incremental if you were to add cldb or zk service to a node we need the key
+    # and mfs needs the dare key
+  - block:
+    - name: Copying cldb.key
+      copy: src='{{inst_tmp}}/cldb.key' dest={{ maprConf }} mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      when: (inventory_hostname in zkNodes or inventory_hostname in cldbNodes)
+      register: cp_cldb
+
+    - name: Copying dare.master.key
+      copy: src='{{inst_tmp}}/dare.master.key' dest='{{ maprConf }}' mode=0600 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      when: diskEncryption|int == 1
+      register: cp_dare
+    # we need to include the master node in this setting because the ansible installer assigns the master label to the
+    # hostname lexically comes first - it does not remember from iteration to iteration which the original master was.
+    # so if you add a node with a name that sorts to be the first in the list - that node gets labeled as the master
+    when: mapr_version_triple.stdout | int < 700 and not is_fresh_install and (security == 'enabled' or security == 'master')
+
+  - block:
+    - name: Copying ssl_keystore.p12
+      copy: src='{{inst_tmp}}/ssl_keystore.p12' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_keystrp12
+      when: keystore_p12.stat.exists|bool == False and mapr_version_triple.stdout | int > 610
+
+    - name: Copying ssl_keystore.pem
+      copy: src='{{inst_tmp}}/ssl_keystore.pem' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_keystrpem
+      when: keystore_pem.stat.exists|bool == False and mapr_version_triple.stdout | int > 601
+
+    - name: Copying ssl_truststore.p12
+      copy: src='{{inst_tmp}}/ssl_truststore.p12' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_truststrp12
+      when: truststore_p12.stat.exists|bool == False
+
+    - name: Copying ssl_truststore.pem
+      copy: src='{{inst_tmp}}/ssl_truststore.pem' dest={{ maprConf }} mode=0444 owner='{{ cluster_admin_id }}' group='{{ cluster_admin_group }}'
+      register: cp_trststrpem
+      when: truststore_pem.stat.exists|bool == False
+    when: mapr_version_triple.stdout | int >= 601 and is_upgrade | bool == True and security == 'enabled'
+
+  - block:
+    - name: Save off mapr.login.conf
+      command: "cp -p {{ maprLoginConf }} {{ maprLoginConf }}.sv.{{ ansible_date_time.epoch }}"
+
+    - name: Install mapr.login.conf
+      command: "cp -p {{ newMaprLoginConf }} {{ maprLoginConf }}"
+
+    when: mapr_version_triple.stdout | int >= 620 and (command == "upgrade" or command == "rolling_upgrade")
+
+
+  # If the cluster_conf file exists, just regenerate the config
+  - name: Regenerating config with configure_refresh.sh, executed from 'configure.yml'
+    action: "configure_refresh.sh MAPR_HOME={{ mapr_home }} IS_UPDATE={{ isUpdate }} TIMEOUT_CONFIGURE={{timeout.configure}} DARE={{ diskEncryption }}"
+    when: (cluster_conf.stat.exists|bool == True and not controlGroupChanged and
+        not changingSecuritySettingMT and not is_fresh_install)
+    register: configure_refresh
+    ignore_errors: True
+
+  # Call the library/do_configure.sh wrapper script
+  - name: Calling do_configure.sh from 'configure.yml'
+    do_configure.sh: MAPR_HOME={{ mapr_home }}
+        MAPR_USER={{ cluster_admin_id }}
+        MAPR_GROUP={{ cluster_admin_group }}
+        CLUSTERNAME={{ cluster_name }}
+        CLDBNODES={{ mapr.groups.cldb|join(',') }}
+        ZKNODES={{ mapr.groups.zk|join(',') }}
+        HISTORYSERVER_HOST={{ HISTORYSERVER_HOST|default('') }}
+        TIMELINESERVER_HOST={{ TIMELINESERVER_HOST|default('') }}
+        HMNODES={{ HIVEMETASTORE_HOSTS|default('') }}
+        ESNODES={{ ELASTICSEARCH_HOSTS|default('') }}
+        ES_DB={{ elasticsearch_path|default('') }}
+        ES_PW={{ log_admin_password|default('') }}
+        NORECALC="{% if patch_file is defined and patch_file|length > 0 %}1{% else %}0{% endif %}"
+        GRAFANA_PW="{% if security == 'disabled' %}{{ metrics_ui_admin_password|default('') }}{% else %}{{ cluster_admin_password }}{% endif %}"
+        OTNODES={{ OPENTSDB_HOSTS|default('') }}
+        DARE={{ diskEncryption }}
+        METERING_CONFIG_ONLY={{ meteringMinConfig }}
+        SECURITY={{ security }}
+        YARN={{ True }}
+        CONTROL_GROUP_CHANGED="{% if controlGroupChanged %}1{% else %}0{% endif %}"
+        SSO_KEYCLOAK={{ configureSSOKeycloak }}
+        LICENSE_MODULES={{ license_modules|join(',') }}
+        LICENSE_TYPE={{ license_type }}
+        TIMEOUT_CONFIGURE={{timeout.configure}}
+        TIMEOUT_MAPRCLI={{timeout.standard}}
+    register: do_configure_result
+    when: cluster_conf.stat.exists|bool == False and (security == 'disabled' or
+          (security == 'enabled' and cp_trststr and cp_keystr and cp_tkt)) or
+          controlGroupChanged or (changingSecuritySettingMT and 'master' not in security)
+    ignore_errors: True
+  - debug: msg="Do configure result {{ do_configure_result }}"
+
+  # If this fails, always remove the clusters.conf file
+  # to that subsequent executions of the playbook will
+  # have a chance at running properly.
+  - file: name="{{ cConfFile }}" state=absent
+    when: do_configure_result is failed
+
+  - set_fact: configure_log="{{ do_configure_result.mapr_logs | regex_search(cfg_log_regexp,'\\3') }}"
+    when: do_configure_result.mapr_logs is defined and do_configure_result is not skipped
+
+  - set_fact: configure_log="{{ configure_refresh.mapr_logs | regex_search(cfg_log_regexp,'\\3') }}"
+    when: configure_refresh.mapr_logs is defined and configure_refresh is not skipped
+
+
+  - debug: var=do_configure_result.mapr_logs
+  - debug: var=configure_refresh.mapr_logs
+  - debug: var=configure_log
+
+  - fetch: src='{{ configure_log[0] }}' dest='{{log_dir}}/{{ ansible_nodename }}_{{ configure_log[0].split('/')[-1] }}' flat=yes validate_checksum=no
+    when: ((do_configure_result.mapr_logs is defined and not do_configure_result is not skipped) or
+           (configure_refresh.mapr_logs is defined and not configure_refresh is not skipped)) and
+           configure_log is defined and configure_log|length > 0
+    register: configure_log_fetched
+
+  - file: path="{{ configure_log[0] }}" state=absent
+    when: configure_log_fetched is succeeded and configure_log_fetched is not skipped
+
+  - fail: msg="{{ do_configure_result.msg }} from 'configure.yml'; check
+        {{ mapr_home }}/logs/configure.log"
+    when: do_configure_result is failed
+
+  - fail: msg="{{ configure_refresh.msg }} from 'configure.yml'; check
+        {{ mapr_home }}/logs/configure.log"
+    when: configure_refresh is failed
+
+  - stat: path="{{ nfsRoleFile }}"
+    register: nfs_role_file
+    check_mode: False
+
+  - stat: path="{{ nfs4RoleFile }}"
+    register: nfs4_role_file
+    check_mode: False
+
+  - stat: path="{{ loopbacknfsRoleFile }}"
+    register: loopbacknfs_role_file
+    check_mode: False
+
+  - stat: path=/mapr
+    register: nfs_mount_dir
+    check_mode: False
+    ignore_errors: yes
+
+  - file: path=/mapr state=directory group="root" owner="root"
+    when: (nfs_role_file.stat.exists|bool == True or nfs4_role_file.stat.exists|bool == True or
+           loopbacknfs_role_file.stat.exists|bool == True) and
+          nfs_mount_dir is defined and nfs_mount_dir.stat is defined and
+          nfs_mount_dir.stat.exists|bool == False
+
+  - ansible.builtin.lineinfile:
+        dest="{{ maprFstabFile }}"
+        line="localhost:/mapr /mapr soft,intr,nolock"
+        create=yes
+        state=present
+        mode=0644
+    when: nfs_role_file.stat.exists|bool == True or nfs4_role_file.stat.exists|bool == True or
+          loopbacknfs_role_file.stat.exists|bool == True
+
+  - name: Configure loopbacknfs
+    block:
+      - shell: ". {{ maprConf }}/env.sh && echo $JAVA_HOME"
+        register: java_home_result
+
+      - debug: var=java_home_result
+
+      - command: "mv {{ loopbacknfscConfFile }} {{ loopbacknfscConfFile }}.orig"
+        ignore_errors: yes
+
+      - file: src="{{ cConfFile }}" dest="{{ loopbacknfscConfFile }}" state=link
+
+      - file: src="{{ maprFstabFile }}" dest="{{ loopbacknfsFstabFile }}" state=link
+
+      - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export MAPR_HOME=' line="export MAPR_HOME={{ maprloopbacknfsHome }}"
+      - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export JAVA_HOME=' line="export JAVA_HOME={{ java_home_result.stdout }}"
+      - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export MAPR_TICKETFILE_LOCATION=' line="export MAPR_TICKETFILE_LOCATION={{ user_ticket_file }}"
+      - block:
+        - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export NFS_LOOPBACK_HONOUR_SUBNETS=' line="export NFS_LOOPBACK_HONOUR_SUBNETS=true"
+        - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export MAPR_SUBNETS=' line="export MAPR_SUBNETS={{ mapr_subnet }}"
+        when: mapr_subnet is defined
+
+    when: loopbacknfs_role_file.stat.exists|bool == True
+
+  - name: Check if mapruserticket file exists
+    stat: path="{{ user_ticket_file }}"
+    register: mapruserticket
+
+  - name: Turn off local/remote JMX so we can generate a new userticket
+    ansible.builtin.lineinfile:
+      path="{{ envOverrideFile }}"
+      create=no
+      regexp="^export MAPR_JXMREMOTEHOST=.*"
+      line='export MAPR_JMXREMOTEHOST="false"'
+    register: jmxremotehost_off
+
+    when: mapruserticket.stat.exists|bool == False and mapr_version_triple.stdout | int >= 620 and (command == "upgrade" or command == "rolling_upgrade")
+
+  - mapr_state.py: state=12

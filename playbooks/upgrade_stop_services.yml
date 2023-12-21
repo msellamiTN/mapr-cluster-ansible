@@ -1,0 +1,277 @@
+- name: "Stop all services for Retry/Upgrade"
+  hosts: all
+  max_fail_percentage: 0
+  vars:
+    MAPR_CLI: "sudo -E -n -u {{ cluster_admin_id }} {{ mapr_home }}/bin/maprcli"
+    maprConf: "{{ mapr_home }}/conf"
+    maprConfConfd: "{{ maprConf }}/conf.d"
+    maprClusterConf: "{{ maprConf }}/mapr-clusters.conf"
+    maprloopbacknfsHome: '/usr/local/mapr-loopbacknfs'
+    mepUpgrade: "{{ mep_upgrade|default(false) }}"
+    securityChange: "{{ changingSecuritySetting|default(false) }}"
+    wait_seconds: 180
+    maintenance_timeout : 30
+
+  environment:
+    MAPR_TICKETFILE_LOCATION: "{{mapr_home}}/conf/mapruserticket"
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  tasks:
+   - name: Determining MapR version
+     shell: cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'
+     register: mapr_version_triple
+     check_mode: False
+
+   - set_fact:
+       mapr_version: "{{mapr_version_triple.stdout}}"
+
+   - block:
+     - name: Check if this host is allowed to upgrade
+       fail: msg="This host is not allowed to upgrade. {{mapr_version_triple.stdout}}"
+       when: mapr_version_triple.rc != 0 or upgrade_version_triple|int < mapr_version_triple.stdout|int
+
+     - stat: path="{{ maprClusterConf }}"
+       register: mapr_clusters_conf
+
+     - shell: "head -1 {{ maprClusterConf }} | grep -o 'secure=\\w*' | cut -d= -f2"
+       ignore_errors: True
+       register: secure_status
+       when: mapr_clusters_conf.stat.exists|bool == True
+
+     - name: Check for unsupported custom secure cluster
+       fail: msg="Custom secure cluster < MapR core 6.0.0 cannot be upgraded"
+       when: command is defined and (command == "upgrade" or command == "rolling_upgrade") and mapr_clusters_conf.stat.exists|bool == True
+          and 'true' in secure_status.stdout and mapr_version|int < 600
+       any_errors_fatal: True
+     when: dont_check is not defined or dont_check|bool == False
+
+   - name: Determining if node has a TaskTracker role
+     stat: path="{{ mapr_home }}/roles/tasktracker"
+     register: tasktrackerRole
+     check_mode: False
+
+   - name: Determining if node has Warden present
+     stat: path="{{ mapr_home }}/initscripts/mapr-warden"
+     register: warden_present
+     check_mode: False
+
+   - name: Determining if node has Zookeeper present
+     stat: path="{{ mapr_home }}/roles/zookeeper"
+     register: zkRole
+     check_mode: False
+
+   - name: Determining if node has loopbacknfs present
+     stat: path="{{ maprloopbacknfsHome }}/roles/loopbacknfs"
+     register: loopbacknfs_present
+     check_mode: False
+
+   - name: "Determine if pid directory is present"
+     stat: path="{{ mapr_home }}/pid"
+     register: mapr_pid_dir_present
+     check_mode: False
+
+   - name: Determining if Spark is running in Standalone mode
+     stat: path="{{ mapr_home}}/roles/spark-master"
+     register: spark_standalone_role
+     check_mode: False
+
+   - name: Determining Spark version
+     shell: cat {{ mapr_home}}/spark/sparkversion
+     register: spark_version
+     ignore_errors: True
+     check_mode: False
+     when: spark_standalone_role.stat.exists|bool == True
+
+   - name: Determining Spark version if no sparkversion file
+     shell: ls -td {{ mapr_home}}/spark/spark-* | cut -d'-' -f2
+     register: spark_version
+     check_mode: False
+     when: spark_standalone_role.stat.exists|bool == True and spark_version is failed
+
+   - name: Determining if a patch has been applied before
+     command: dpkg -s mapr-patch
+     register: patch_applied_debian
+     ignore_errors: True
+     when: ansible_os_family == 'Debian'
+
+   - name: Determining if a patch has been applied before
+     command: rpm -q mapr-patch
+     register: patch_applied_redhat_suse
+     ignore_errors: True
+     when: ansible_os_family == 'RedHat' or ansible_os_family == 'Suse'
+
+   - name: Determining Hadoop mode (YARN vs Classic)
+     check_hadoop_version.py: mapr_user='{{ cluster_admin_id }}' timeout={{timeout.standard}}
+     register: hadoop_mode
+     check_mode: False
+
+   - block:
+     - block:
+       - name: "Stop CLDB process on the node before starting rolling upgrade"
+         shell: "{{ MAPR_CLI }} node services -name cldb -action stop -nodes {{ ansible_nodename }}"
+         run_once: True
+         ignore_errors: True
+         register: stop_cldb
+
+       - name: "Wait {{ wait_seconds | int }} second(s) for CLDB to failover for "
+         ansible.builtin.pause:
+           seconds: "{{ wait_seconds | int }}"
+ 
+       when: inventory_hostname in mapr.groups.cldb
+
+     - name: "Set the node to maintenance mode"
+       shell: "{{ MAPR_CLI }} node maintenance -timeoutminutes {{ maintenance_timeout }} -nodes {{ ansible_nodename }}"
+       run_once: True
+       ignore_errors: True
+       register: start_maintenance
+
+     - debug: var=start_maintenance
+       when: start_maintenance is failed
+     
+     - name: "Notify the CLDB that the node is going to be upgraded"
+       shell: "{{ MAPR_CLI }} notifyupgrade start -node {{ ansible_nodename }}"
+       run_once: True
+       ignore_errors: True
+       register: notify_upgrade
+
+     - debug: var=notify_upgrade
+       when: notify_upgrade is failed
+     
+     when: command is defined and command == "rolling_upgrade"
+
+   - name: Blacklisting TaskTracker. New jobs will not be assigned to the node
+     command: "/usr/bin/hadoop1 job -blacklist-tracker {{ansible_fqdn}}"
+     become: True
+     become_user: "{{ cluster_admin_id }}"
+     run_once: True
+     ignore_errors: True
+     when: tasktrackerRole.stat.exists|bool == True and hadoop_mode.default_mode == "classic"
+
+   - name: Waiting for current tasks on the node to complete
+     action: "wait_till_jobs_done.sh"
+     when: tasktrackerRole.stat.exists|bool == True and wait_for_jobs
+
+   - name: Stoping spark slaves in standalone mode
+     command: "{{mapr_home}}/spark/spark-{{spark_version}}/sbin/stop-slaves.sh"
+     ignore_errors: True
+     when: spark_standalone_role.stat.exists|bool == True
+
+   - block:
+     - name: change hadoop mode
+       command: "{{ MAPR_CLI }} cluster mapreduce set -mode yarn"
+       ignore_errors: True
+
+     - ansible.builtin.lineinfile: path="{{ maprConf }}/hadoop_version" state=present regexp='^default_mode=' line='default_mode=yarn'
+     when: upgrade_version_triple == 600
+
+   - name: "Find MapR processes where pid are symbolic links"
+     shell: "find {{ mapr_home }}/pid -type l -print"
+     register: mapr_pid_symbolic_links
+     when: mapr_pid_dir_present.stat.exists|bool == True
+
+     # some pid files may go away while we look or some services remove the pid file when they exit but not the symlink
+   - name: "Find any running MapR processes where pid are symbolic links"
+     shell: "echo {{ mapr_pid_symbolic_links.stdout|regex_replace('\n',' ') }} | xargs ls -l | awk '{print $NF}' | xargs cat 2> /dev/null"
+     ignore_errors: True
+     register: mapr_symbolic_pids
+     when: mapr_pid_dir_present.stat.exists|bool == True and mapr_pid_symbolic_links is success and
+           mapr_pid_symbolic_links.stdout_lines|length > 0
+
+   - name: "Find any running MapR processes"
+     shell: "find {{ mapr_home }}/pid -type f -print | xargs cat 2> /dev/null"
+     ignore_errors: True
+     register: mapr_pids
+     when: mapr_pid_dir_present.stat.exists|bool == True
+
+     # unmount /mapr before stopping warden to try to avoid hung nfs mounts
+   - command: "umount -f -l /mapr"
+     ignore_errors: True
+     register: umount_mapr
+
+   - debug: var=umount_mapr
+
+   - name: check if warden is running
+     command: "{{ mapr_home}}/initscripts/mapr-warden status"
+     ignore_errors: True
+     register: warden_status
+
+   - block:
+     - name: get list of the ECO warden
+       find: paths="{{ maprConfConfd }}" patterns="warden.*.conf"
+       register: eco_warden_files
+
+     - name: Disable Eco services
+       command:  "maprcli node services -name {{ item.path|regex_replace('.*warden\\.(.*)\\.conf','\\1') }} -action disable -nodes {{ ansible_nodename }}"
+       ignore_errors: True
+       with_items: "{{ eco_warden_files.files }}"
+       when: eco_warden_files is succeeded and eco_warden_files.files
+       register: eco_disable
+
+     - debug: msg="WARNING:\ Some ecosystems failed to disable, which means an additional restart may be needed after install for those"
+       when: eco_disable is failed
+
+     - debug: var=eco_disable
+       when: eco_disable is failed
+     when: mapr_version|int >= 610 and warden_status is succeeded and (command == "upgrade" or command == "rolling_upgrade" or mepUpgrade or securityChange)
+
+   - name: Stopping loopbacknfs MapR service
+     service: name=mapr-loopbacknfs state=stopped
+     when: loopbacknfs_present.stat.exists|bool == True
+
+   - name: Stopping all MapR services
+     service: name=mapr-warden state=stopped
+     when: warden_present.stat.exists|bool == True
+  
+   # IN-2017 Upgrade to 6.1.0 must regenerate user mapruserticket file. Otherwise, impersonation fails for all services
+   - name: "remove incompatible marpuserticket"
+     file: path="{{ mapr_home }}/conf/mapruserticket" state=absent
+     register: mapruserticket_removed
+     when: command is defined and (command == "upgrade" or command == "rolling_upgrade") and mapr_clusters_conf.stat.exists|bool == True
+          and 'true' in secure_status.stdout and mapr_version|int < 610
+
+   - name: Stopping Zookeeper service
+     service: name=mapr-zookeeper state=stopped
+     when: zkRole.stat.exists|bool == True
+
+   - name: Removing patch, if exists
+     become: False
+     apt: name=mapr-patch state=absent
+     when: ansible_os_family == 'Debian' and patch_applied_debian.rc == 0
+
+   - name: Removing patch, if exists
+     yum: name=mapr-patch state=absent
+     when: ansible_os_family == 'RedHat' and patch_applied_redhat_suse.rc == 0
+
+   - name: Removing patch, if exists
+     zypper: name=mapr-patch state=absent
+     when: ansible_os_family == 'Suse' and patch_applied_redhat_suse.rc == 0
+
+   - name: Wait for warden to exit
+     become: False
+     wait_for:
+       path: /var/lock/subsys/mapr-warden
+       state: absent
+
+   - name: Kill orphan pids
+     command: "kill -9 {{ item }}"
+     ignore_errors: True
+     with_items:
+       - "{{ mapr_pids.stdout_lines }}"
+     when: mapr_pid_dir_present.stat.exists|bool == True and mapr_pids is success and
+           mapr_pids.stdout_lines is defined
+
+   - name: Kill orphan pids
+     command: "kill -9 {{ item }}"
+     ignore_errors: True
+     with_items:
+       - "{{ mapr_symbolic_pids.stdout_lines }}"
+     when: mapr_pid_dir_present.stat.exists|bool == True and mapr_symbolic_pids is success and
+           mapr_symbolic_pids.stdout_lines is defined
+
+   - name: Determining if cldb removed its pid file
+     stat: path="{{ mapr_home }}/pid/cldb.pid"
+     register: cldbPidFile
+
+   - name: Remove cldb pid file
+     file: path="{{ mapr_home }}/pid/cldb.pid" state=absent
+     when: cldbPidFile.stat.exists|bool == True

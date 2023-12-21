@@ -1,0 +1,149 @@
+---
+#
+# Playbook Name:: os_base_debian
+#
+# Copyright 2013, MapR Technologies
+#
+#       Sub-section of os_base.yml
+#
+
+- name: Configuring OS prerequisites
+  hosts: Debian
+  serial: "{{ forks }}"
+  gather_facts: False
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    mapr_deb_prereqs: "ca-certificates, cron, curl,debianutils, dnsutils, gnupg, iputils-arping,\
+      libibverbs1, libnss3, libsysfs2, lsof, netcat,nfs-common, ntp, ntpdate, openssl,\
+      python-pycurl, python-yaml, python-apt-dev, sdparm, sudo, syslinux, syslinux-utils, sysstat, uuid-runtime,\
+      wget, apt-transport-https, libcap2-bin, python3, python3-pymysql, python3-dev, python3-apt, coreutils"
+    mapr_deb_prereqs_16: "libpython2.7, python, python-dev, python-pymysql, python-apt"
+    mapr_deb_prereqs_18: "libpython3.8, python, python-dev, python-pymysql, python3-pycurl, python3-yaml, rdma-core"
+    mapr_deb_prereqs_20: "libpython3.8, python2, python2-dev, python3-pycurl, python3-yaml, rdma-core, libjemalloc2"
+    swap_val: 0
+
+  pre_tasks:
+    - stat: path=/var/cache/apt/pkgcache.bin
+      register: apt_cache_stat
+      check_mode: False
+    - apt: update_cache=yes
+      check_mode: False
+
+  tasks:
+
+  - set_fact: swap_val=1
+    when: ansible_kernel is version_compare('2.6.32', '>')
+
+  - name: Running apt autoremove, removing orphaned packages
+    command: apt-get -qq -y autoremove
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - name: Install debian prereqs
+    apt:
+      name: "{{ mapr_deb_prereqs }}"
+      force: yes
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: apt_prereq_install
+    until: apt_prereq_install is succeeded
+
+  - name: Install debian prereqs - 16.04
+    apt:
+      name: "{{ mapr_deb_prereqs_16 }}"
+      force: yes
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: apt_prereq_install_u16
+    until: apt_prereq_install_u16 is succeeded
+    when: ansible_distribution_version is version_compare('16.04', '>=') and
+          ansible_distribution_version is version_compare('18.04', '<')
+
+  - name: Install debian prereqs - 18.04
+    apt:
+      name: "{{ mapr_deb_prereqs_18 }}"
+      force: yes
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: apt_prereq_install_u18
+    until: apt_prereq_install_u18 is succeeded
+    when: ansible_distribution_version is version_compare('18.04', '>=') and
+          ansible_distribution_version is version_compare('20.04', '<')
+
+  - name: Install debian prereqs - 20.04
+    apt:
+      name: "{{ mapr_deb_prereqs_20 }}"
+      force: yes
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: apt_prereq_install_u20
+    until: apt_prereq_install_u20 is succeeded
+    when: ansible_distribution_version is version_compare('20.04', '>=')
+
+  - name: Installing clustershell,ethtool,pdsh
+    apt:
+      name: clustershell,ethtool,pdsh
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: apt_clush_install
+    until: apt_clush_install is succeeded
+    ignore_errors: True
+
+  - name: Grepping pam_limits
+    shell: grep "^[[:space:]]*session[[:space:]].*required[[:space:]].*pam_limits.so" /etc/pam.d/common-session
+    register: pam_limits_found
+    ignore_errors: True
+  - debug:
+      msg: "Pam limits: {{ pam_limits_found }}"
+    when: pam_limits_found != ""
+
+  - ansible.builtin.lineinfile: path='/etc/pam.d/common-session' create=yes insertafter=EOF line='session required pam_limits.so'
+    when: pam_limits_found.rc != 0
+
+  - name: Grepping pam_limits for noninteractive
+    shell: grep "^[[:space:]]*session[[:space:]].*required[[:space:]].*pam_limits.so" /etc/pam.d/common-session-noninteractive
+    register: pam_limits_found
+    ignore_errors: True
+  - debug:
+      msg: "Pam limits: {{ pam_limits_found }}"
+    when: pam_limits_found != ""
+
+  - ansible.builtin.lineinfile: path='/etc/pam.d/common-session-noninteractive' create=yes insertafter=EOF line='session required pam_limits.so'
+    when: pam_limits_found.rc != 0
+
+  - name: Setting net.ipv4.tcp_retries to 5
+    sysctl: name="net.ipv4.tcp_retries2" value=5 state=present ignoreerrors=yes
+
+  - name: Setting vm.overcommit_memory to 0
+    sysctl: name=vm.overcommit_memory value=0 state=present ignoreerrors=yes
+
+  - name: Setting vm.swappiness to {{ swap_val }}
+    sysctl: name=vm.swappiness value={{ swap_val }} state=present ignoreerrors=yes
+
+  - name: Restarting ntp 
+    service: name=ntp state=started enabled=yes
+
+    # rdma-ndd is automatically started when an RDMA device is present
+  - name: Starting rdma-iwarp
+    service: name=iwpmd state=started enabled=yes
+    when: ansible_distribution_version is version_compare('18.04', '>=')
+
+  - name: Checking for /sbin/insserv presence
+    stat: path=/sbin/insserv
+    register: insserv_broken
+    ignore_errors: True
+    check_mode: False
+
+  - file: path=/sbin/insserv src=/usr/lib/insserv/insserv state=link
+    when: ansible_distribution_major_version|int == 12 and insserv_broken.stat.exists|bool == False
+
+  - mapr_state.py: state=2

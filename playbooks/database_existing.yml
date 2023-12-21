@@ -1,0 +1,159 @@
+- name: Configuring database (for existing DB)
+  hosts: all
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+  vars:
+    mysql_hname_lim: 60
+    admin_password: "{{ db_admin_password|default('') }}"
+    admin_user: "{{ db_admin_user|default('') }}"
+    mysql_host: "{{ shared_mysql_host|default('') }}"
+    any_remote_host_ip: "%"
+    ansible_python_interpreter: /usr/bin/python3
+  tasks:
+
+    - block:
+        - name: "Installing mysql with yum."
+          yum:
+            name: mysql
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: yum_mysql
+          until: yum_mysql is succeeded
+
+        - name: "Installing MySQL-python with yum for Redhat7"
+          yum:
+            name: MySQL-python
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: yum_mysql_python
+          until: yum_mysql_python is succeeded
+          when:  ansible_distribution_major_version == '7'
+
+        - name: "Installing MySQL-python with yum for Redhat8"
+          yum:
+            name: python3-PyMySQL
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: yum_python3_pymysql
+          until: yum_python3_pymysql is succeeded
+          when: ansible_distribution_major_version == '8'
+      when: ansible_os_family == 'RedHat'
+
+    - block:
+        - name: "Installing MYSQL client with apt."
+          apt:
+            name: mysql-client
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: apt_mysql_client
+          until: apt_mysql_client is succeeded
+          when: ansible_distribution_version is version_compare('20.04', '<')
+
+        - name: "Installing mariadb client with apt."
+          apt:
+            name: mariadb-client
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: apt_mariadb_client
+          until: apt_mariadb_client is succeeded
+          when: ansible_distribution_version is version_compare('20.04', '>=')
+
+        - name: "Installing python-mysqldb with apt."
+          apt:
+            name: python-mysqldb
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: apt_python_mysqldb
+          until: apt_python_mysqldb is succeeded
+          when: ansible_distribution_version is version_compare('16.04', '<=')
+
+        - name: "Installing python-pymysql with apt."
+          apt:
+            name: python-pymysql
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: apt_python_pymysql
+          until: apt_python_pymysql is succeeded
+          when: ansible_distribution_version is version_compare('16.04', '>') and
+                ansible_distribution_version is version_compare('20.04', '<')
+
+        - name: "Installing python3-pymysql with apt."
+          apt:
+            name: python3-pymysql
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: apt_python3_pymysql
+          until: apt_python3_pymysql is succeeded
+          when: ansible_distribution_version is version_compare('20.04', '>=')
+      when: ansible_os_family == 'Debian'
+
+    - block:
+        - name: "Installing MYSQL client with zypper."
+          zypper:
+            name: mysql-client
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: zypper_mysql_client
+          until: zypper_mysql_client is succeeded
+
+        - name: "Installing python-mysql with zypper."
+          zypper:
+            name: python-mysql
+            state: present
+          retries: "{{ package_manager_retries }}"
+          delay: "{{ package_manager_delay_sec }}"
+          register: zypper_python_mysql
+          until: zypper_python_mysql is succeeded
+      when: ansible_os_family == 'Suse'
+
+    - name: "Check connectivity to MySQL"
+      shell: "mysql -h {{ mysql_host }} -u{{ admin_user }} -p{{ admin_password }} -e'quit'"
+      register: mysql_secured
+      ignore_errors: True
+
+    - block:
+        - debug: msg = {{ mysql_secured.stderr }}
+        - name: "Check that MySQL accessible"
+          fail: msg="MySQL is not secured, unreachable or {{ admin_user }} username/password incorrect"
+      when: ("not secured" in mysql_secured.stderr) or
+        ("Access denied for user" in mysql_secured.stderr) or
+        ("Can't connect to MySQL server on" in mysql_secured.stderr) or
+        ("not allowed to connect to this MySQL server" in mysql_secured.stderr)
+
+
+    - name: "Add service databases"
+      mysql_db:
+        login_user="{{ admin_user }}"
+        login_password="{{ admin_password }}"
+        login_host="{{ mysql_host }}"
+        name="{{ item.name }}"
+        state=present
+        encoding=utf8
+        collation=utf8_general_ci
+      register: ADD_SERVICE_DB
+      with_items: "{{ mapr.node.db.mysql_databases_existing }}"
+
+    - name: "Setup service database users"
+      mysql_user:
+        login_user="{{ admin_user }}"
+        login_password="{{ admin_password }}"
+        login_host="{{ mysql_host }}"
+        name="{{ item.user }}"
+        password="{{ item.password }}"
+        priv="{{ item.name + '.*:ALL,GRANT' }}"
+        host="{{ any_remote_host_ip }}"
+        state=present
+      register: ADD_SERVICE_DB_USER
+      with_items: "{{ mapr.node.db.mysql_databases_existing }}"

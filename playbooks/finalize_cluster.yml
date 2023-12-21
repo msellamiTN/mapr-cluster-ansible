@@ -1,0 +1,219 @@
+---
+#
+# Playbook Name:: finalize_cluster
+#
+# Copyright 2017, MapR Technologies
+#
+#   A few simple steps once the cluster is running
+#   All maprcli commands MUST be run as mapr user
+
+- name: Finalizing cluster configuration
+  hosts: all
+  serial: "{{ forks }}"
+  gather_facts: False
+
+  vars:
+    coreSiteFile: "{{ mapr_home }}/hadoop/hadoop-0.20.2/conf/core-site.xml"
+    security: "{{ mapr.node.security|default('disabled') }}"
+    maprConf: "{{ mapr_home }}/conf"
+    ticket_file: "{{ maprConf }}/mapruserticket"
+    installer_tmp_dir: "/tmp/installer"
+    envOverrideFile: "{{ maprConf }}/env_override.sh"
+    tmp_installer_license: "{{ installer_tmp_dir }}/license.txt"
+    maprloopbacknfsHome: "/usr/local/mapr-loopbacknfs"
+    loopbacknfsRoleFile: "{{ maprloopbacknfsHome }}/roles/loopbacknfs"
+    nfs_service: "{% if data.nfs_type|default('NFSv3') == 'NFSv3' %}nfs{% else %}nfs4{% endif %}"
+    retry_delay: 5
+    retry_count: 120
+    MAPR_CLI: "sudo -E -n -u {{ cluster_admin_id }} {{ mapr_home }}/bin/maprcli"
+
+  environment:
+    MAPR_TICKETFILE_LOCATION: "{{ ticket_file }}"
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  tasks:
+  - stat: path="{{ maprConf }}/mapr-clusters.conf"
+    register: mapr_configured
+    check_mode: False
+  - stat: path="{{ mapr_home }}/initscripts/mapr-warden"
+    register: warden_present
+    check_mode: False
+  - stat: path="{{ loopbacknfsRoleFile }}"
+    check_mode: False
+    register: loopbacknfs_present
+
+  - stat: path="{{ coreSiteFile }}"
+    register: coresite_present
+    check_mode: False
+
+  - block:
+    - name: Create user ticket
+      wait_for: path="{{ticket_file}}" timeout={{timeout.ticket_wait*60}}
+      register: user_tkt_crtd
+      ignore_errors: True
+
+    - fail: msg="{{ticket_file}} failed to be created. Please check {{ mapr_home }}/logs/warden.log"
+      when: user_tkt_crtd is failed
+
+    - file: path={{ ticket_file }} owner={{ cluster_admin_id }} group={{ cluster_admin_group }}
+      when: user_tkt_crtd
+    when: (is_fresh_install or mapr.node.installed|bool == False or changingSecuritySettingMT or mapruserticket_removed is succeeded) and (security == 'enabled' or security == 'master')
+
+  - debug: var=jmxremotehost_off
+
+  - name: reset JMX_REMOTEHOST
+    ansible.builtin.lineinfile:
+      path="{{ envOverrideFile }}"
+      create=no
+      regexp="^export MAPR_JXMREMOTEHOST=.*"
+      line='export MAPR_JMXREMOTEHOST="true"'
+    register: jmxremotehost_on
+    when: jmxremotehost_off is succeeded and jmxremotehost_off is not skipped
+
+# This is a delicate process.   For the initial node (identified
+# with installType == 'n'), the playbook waits for the CLDB service
+# if we're the only control node (since the initial node is
+# ALWAYS a control node).  Otherwise, we fall through and tell the
+# user to deploy the remaining control nodes.
+#
+# Controlling the debug output messages is very kludgey ... we
+# print out the message when the step is not "skipped".  A cleaner
+# execution model would be great, but I can't identify one in Ansible.
+
+  # Print out the status message from the # wait_for_cldb.sh script.
+  - debug: msg="CLDB nodes - {{ mapr.groups.cldb|join(', ') }}"
+
+  - name: Wait for CLDB(s) to come online
+    # Use default timeout + 1 minute
+    wait_for_cldb.sh:
+      MAPR_USER: "{{ cluster_admin_id }}"
+      MAPR_HOME: "{{ mapr_home }}"
+      TIMEOUT_MAPRCLI: "{{ timeout.standard | int + 60 }}"
+    register: cldb_online
+    when: mapr_configured.stat.exists|bool == True and warden_present.stat.exists|bool == True and
+          mapr.groups.cldb|length > 0 and user_tkt_crtd
+    retries: "{{ retry_count }}"
+    until: cldb_online is not failed
+    delay: "{{ retry_delay }}"
+
+  - debug: msg="CLDB service will come on-line after Zookeeper quorum is achieved which requires the other control nodes to be installed. Please proceed with installation on remaining control nodes"
+    when: mapr_configured.stat.exists|bool == True and warden_present.stat.exists|bool == True and
+          mapr.groups.cldb|length > 1
+
+  # A few maprcli commands that are more easily structured in a script
+  # This script always returns "Changed=True" on success.
+  #
+  # NOTE: We only run this when the "wait_for_cldb.sh" above has
+  #       returned "changed=True" (indicating that the CLDB master was
+  #       discovered).  If the action is skipped, we print out
+  #       one final message.
+  - finalize_cluster.sh: MAX_WAIT=300 MAPR_USER={{ cluster_admin_id }} MAPR_HOME={{ mapr_home }} TIMEOUT_MAPRCLI={{timeout.standard}}
+    register: cluster_success
+    when: cldb_online is changed and user_tkt_crtd
+
+  - block:
+    - set_fact: gw_hosts="{{ GATEWAY_HOSTS | regex_replace(',',' ') }}"
+
+    - shell: "{{ MAPR_CLI }} cluster gateway set -dstcluster {{cluster_name }} -gateways \"{{ gw_hosts }}\""
+      run_once: True
+    when: mapr_db == 'QS' or mapr_db == 'DRILLQS'
+
+  - shell: "{{ MAPR_CLI }} cluster gateway set -dstcluster {{ cluster_name }} -gateways localhost"
+    run_once: True
+    when: mapr_db == 'QSLITE'
+
+  - local_action: stat path="{{license_tmp_file}}"
+    become: False
+    register: has_license
+
+  - block:
+
+    - file:
+        path: "{{ installer_tmp_dir }}"
+        state: directory
+
+    - copy:
+        src: "{{ license_tmp_file }}"
+        dest: "{{ tmp_installer_license }}"
+      register: copied_file
+      run_once: True
+
+
+    - block:
+      - shell: "{{ MAPR_CLI }} license add -is_file true -license {{ tmp_installer_license }}"
+        run_once: True
+        ignore_errors: True
+
+      - file:
+          path: "{{ tmp_installer_license }}"
+          state: absent
+
+      - name: "Bounce NFS server so it sees the new license - since warden might wait 30min"
+        shell: "{{ MAPR_CLI }} node services -name {{ nfs_service }}  -action restart -nodes {{ groups.all|join(',') }}"
+        run_once: True
+        ignore_errors: True
+        register: bounce_nfs
+
+      - debug: msg="Failed to bounce NFS servers for all nodes - it might take a while before NFS service is available"
+        when: bounce_nfs is failed
+
+      when: copied_file
+    when: is_fresh_install and has_license.stat.exists|bool == True
+
+    # we do this here after we are sure clbd is up, otherwise systemctl start mapr-loopbacknfs might fail
+  - name: Run and enable loopbacknfs
+    service: name=mapr-loopbacknfs enabled=yes state=started
+    when: loopbacknfs_present.stat.exists|bool == True
+
+  - name: Restart and enable loopbacknfs
+    service: name=mapr-loopbacknfs enabled=yes state=restarted
+    when: loopbacknfs_present.stat.exists|bool == True and (changingSecuritySettingMT or command == "upgrade" or command == "rolling_upgrade")
+
+
+  - name: Set rack topology 
+    mapr_node_topology.py: data='{{ mapr.node|to_json }}'
+      mapr_user='{{ cluster_admin_id }}' timeout={{timeout.standard}}
+    when: is_update is not defined and user_tkt_crtd
+
+  - name: Set Hadoop Classic mode
+    command: "{{ MAPR_CLI }} cluster mapreduce set -mode classic"
+    ignore_errors: True
+    run_once: True
+    when: classic_mode and is_update is not defined
+
+  - debug: msg="{{ cluster_success.msg }}"
+    when: cluster_success is changed
+
+  - debug: msg="Successfully installed MapR on initial node {{ mapr.node.hostname }}.  Cluster will come on-line once a majority of the control nodes are successfully deployed.  After the other control nodes are installed, verify cluster operation with the command 'hadoop fs -ls /'"
+    when: cluster_success is skipped and warden_present.stat.exists|bool == True
+
+  - name: "Check /mapr is mounted"
+    shell: df | grep /mapr
+    async: 30
+    poll: 5
+    register: mapr_mounted
+    ignore_errors: True
+
+    # needed to give loopbacknfs time to start - otherwise this succeeds but no mount is present
+  - name: Mount /mapr
+    command: "mount -o soft,intr,nolock localhost:/mapr /mapr"
+    retries: "{{ retry_count }}"
+    delay: "{{ retry_delay }}"
+    register: mount_mapr
+    until: mount_mapr is not failed
+    when: loopbacknfs_present.stat.exists|bool == True and mapr_mounted.rc == 1
+
+#  - name: Remove manageSSLKeyFlag file
+#    ansible.builtin.file:
+#      path: "{{ maprManageSSLKeyFlag }}"
+#      state: absent
+#    when: command == "upgrade" or command == "rolling_upgrade"
+
+  - debug: msg="Successfully installed MapR client on {{ mapr.node.hostname }}.  Use 'hadoop' or 'maprcli' commands to access the cluster"
+    when: warden_present.stat.exists|bool == False
+
+  - mapr_state.py: state=18
+    when: is_update is not defined
+
+  - mapr_complete.py: command="{{ command }}"
+    when: is_update is defined

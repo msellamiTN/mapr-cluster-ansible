@@ -1,0 +1,16 @@
+---
+#
+# Playbook Name:: final
+#
+# Copyright 2023, HPE
+#
+
+- name: Running final tasks before exit
+  hosts: all
+  serial: "{{ forks }}"
+
+  tasks:
+    - name: Remove installation lock
+      file:
+        path: "{{ mapr_home }}/installer-lock.file"
+        state: absent

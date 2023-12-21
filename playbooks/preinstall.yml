@@ -1,0 +1,22 @@
+---
+#
+# Playbook Name:: preinstall.yml
+#
+# Copyright 2019, MapR Technologies
+#
+
+- name: Custom Preinstall playbook hook
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+      cpbs_disable: "{{ custom_pbs_disable|default(false) }}"
+
+  tasks:
+     - local_action: stat path="{{ maprCustomDir }}/preinstall"
+       become: false
+       register: preinstalldir
+
+     - include_role:
+          name: preinstall
+       when: preinstalldir.stat.exists and not cpbs_disable

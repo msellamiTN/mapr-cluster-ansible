@@ -1,0 +1,34 @@
+---
+
+- mapr_state.py: state=17
+
+- name: Deploy new VMs
+  mapr_azure_extend.py:
+    node_count_param: nodeCount
+    admin_password_param: adminPassword
+    mapr_password_param: clusterAdminPassword
+    deployment_name: MapR.VM.Template
+    auth_type: service_principal
+    subscription_id: "{{ provider.config.subscription_id }}"
+    tenant: "{{ provider.config.tenant_id }}"
+    client_id: "{{ provider.config.client_id }}"
+    secret: "{{ provider.encryptedConfig.secret }}"
+    admin_password: "{{ provider.encryptedConfig.admin_password | default(omit) }}"
+    mapr_password: "{{ ssh_password }}"
+    resource_group: "{{ provider.config.resource_group }}"
+    cluster_name: "{{ cluster_name }}"
+    add_count: "{{host_count}}"
+  register: new_vm_result
+
+- debug: msg="azure results {{ new_vm_result }}"
+
+- set_fact:
+    ips: "{{ new_vm_result.new_ips }}"
+
+- name: Add new instance(s) to variable
+  add_host:
+    hostname: "{{ item }}"
+    groupname: "provisioned_ips"
+  with_items: "{{ ips }}"
+
+- mapr_state.py: state=18

@@ -1,0 +1,73 @@
+---
+#
+# Playbook Name:: uninstall_mapr_cloud
+#
+# Copyright 2017, MapR Technologies
+#
+
+- name: Delete mapr cluster in the cloud 
+  hosts: localhost
+  gather_facts: False
+  become: False
+  tasks:
+  # AWS block
+  - block:
+    - fail:
+        msg: "AWS access and secret key needs to be provided to delete a stack"
+      when: provider.config.aws_access_key is not defined or provider.config.aws_secret_key is not defined
+
+    - name: Update AWS asg
+      ec2_asg:
+        aws_access_key: "{{ provider.config.aws_access_key }}"
+        aws_secret_key: "{{ provider.config.aws_secret_key }}"
+        region: "{{ provider.config.aws_region }}"
+        name: "{{ provider.config.auto_scaling_group }}"
+        max_size: "0"
+        min_size: "0"
+        desired_capacity: "0"
+        suspend_processes: []
+        validate_certs: False
+
+    - ec2_asg_facts:
+        aws_access_key: "{{ provider.config.aws_access_key }}"
+        aws_secret_key: "{{ provider.config.aws_secret_key }}"
+        region: "{{ provider.config.aws_region }}"
+        name: "{{ provider.config.auto_scaling_group }}"
+        validate_certs: False
+      register: asg_facts
+
+    - ec2_lc:
+        aws_access_key: "{{ provider.config.aws_access_key }}"
+        aws_secret_key: "{{ provider.config.aws_secret_key }}"
+        region: "{{ provider.config.aws_region }}"
+        name: "{{ asg_facts.results[0].launch_configuration_name }}"
+        validate_certs: False
+      when: asg_facts.results[0].launch_configuration_name is match(".*-mapr")
+
+    - name: Delete AWS stack
+      cloudformation:
+        aws_access_key: "{{ provider.config.aws_access_key }}"
+        aws_secret_key: "{{ provider.config.aws_secret_key }}"
+        region: "{{ provider.config.aws_region }}"
+        stack_name: "{{ provider.config.cf_stack_name }}"
+        state: "absent"
+        validate_certs: False
+      when: provider.config.cf_stack_name is defined
+
+    when: provider is defined and provider.id == "AWS"
+
+  # Azure block
+  - block:
+    - fail:
+        msg: "Azure resource group, subscription_id and tenant_id needs to be provided to delete a stack"
+      when: provider.config.resource_group is not defined or provider.config.subscription_id is not defined or provider.config.tenant_id is not defined
+
+    - name: Delete Azure resource group
+      mapr_azure_delete.py:
+        subscription_id: "{{ provider.config.subscription_id }}"
+        auth_type: service_principal
+        client_id: "{{ provider.config.client_id }}"
+        secret: "{{ provider.encryptedConfig.secret }}"
+        tenant: "{{ provider.config.tenant_id }}"
+        resource_group: "{{ provider.config.resource_group }}"
+    when: provider is defined and provider.id == "AZURE"

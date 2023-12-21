@@ -1,0 +1,7 @@
+---
+- name: Checking connection
+  hosts: all
+
+  tasks:
+  - name: Group by OS family
+    group_by: key={{ ansible_os_family }}

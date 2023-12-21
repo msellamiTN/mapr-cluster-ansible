@@ -1,0 +1,147 @@
+---
+
+- name: Provision cloud instances
+  hosts: localhost
+  gather_facts: False
+  become: False
+  vars:
+    host_count: "{{provider.config.count}}"
+    scale: False
+  roles:
+    - {role: aws, when: "provider.id == 'AWS'"}
+    - {role: azure, when: "provider.id == 'AZURE'"}
+    - {role: google, when: "provider.id == 'GOOGLE'"}
+
+- name: Hostname provisioned ips
+  hosts: provisioned_ips
+  gather_facts: False
+  tasks:
+  # There are occasions in Azure that the VM is SSH accesable then for some reason the SSHD service is restarted
+  # which causes random failures. The workaround is to wait for all VMs to be accessable then wait a little bit and
+  # then try and access the VMs again hoping that any restart happened between the two checks.
+  - name: wait for ssh access on Azure
+    wait_for_connection:
+      delay: 10
+      sleep: 10
+      timeout: 1200
+    when: provider.id == 'AZURE'
+
+  - name: wait for ssh access
+    wait_for_connection:
+      delay: 20
+      sleep: 5
+      timeout: 300
+
+# We need to gather_facts for the provisioned_ips so we can get ip, hostname and domain name information in mapr_azure_hostnames.py
+- name: Post provision tasks
+  hosts: provisioned_ips
+  gather_facts: True
+  tasks:
+  # AZURE: on every node, gather ip, hostname and domain name information and set the information correctly in /etc/hosts
+  - block:
+    - mapr_azure_hostnames.py:
+        hostvars: "{{ hostvars }}"
+      register: azure_host_info
+
+    - ansible.builtin.lineinfile:
+        dest=/etc/hosts
+        create=yes
+        backup=yes
+        line="{{ item }}"
+      with_items: "{{ azure_host_info.entries }}"
+    when: provider.id == 'AZURE'
+
+  - block:
+    - name: Get ssh key
+      uri:
+        url: http://169.254.169.254/latest/meta-data/public-keys/0/openssh-key
+        return_content: yes
+      delegate_to: localhost
+      become: False
+      register: user_key
+
+    - name: Register ssh key with the nodes created
+      authorized_key:
+        user: "{{ssh_id}}"
+        key: "{{user_key['content']}}"
+    when: provider.id == 'AWS'
+
+  - stat: path="{{ mapr_home }}/server"
+    register: mapr_home_exists
+
+  - name: Update hostid, hostname files and reset password
+    environment:
+      MAPR_USER: "{{ cluster_admin_id }}"
+      MAPR_USER_PASSWORD: "{{ cluster_admin_password }}"
+    shell: |
+      HOST=""
+      RC=0
+      if hostname -A > /dev/null 2>&1; then
+          HOST="$(hostname -A | cut -d' ' -f1)"
+      fi
+      if [ -z "$HOST" ] && hostname --fqdn > /dev/null 2>&1; then
+          HOST="$(hostname --fqdn 2>/dev/null)"
+      fi
+      if [ -z "$HOST" ]; then
+          HOST="$(hostname 2>/dev/null)"
+      fi
+      if [ -z "$HOST" ] && hostname -I > /dev/null 2>&1; then
+          HOST="$(hostname -I | cut -d' ' -f1)"
+      fi
+      if [ -n "$HOST" ]; then
+          echo "$HOST" > hostname
+      else
+          echo "Failed to set hostname - install will fail"
+          exit -1
+      fi
+      hostid=$(server/mruuidgen)
+      if [ -z "$hostid" ]; then
+          echo "Failed to create hostid"
+          exit -1
+      fi
+      echo "$hostid" > hostid
+      rm -f conf/hostid.*
+      echo "$hostid" > conf/hostid.$$
+      echo "${MAPR_USER}:${MAPR_USER_PASSWORD}" | chpasswd
+      exit $?
+    args:
+      chdir: "{{ mapr_home }}"
+    when: mapr_home_exists.stat.exists|bool == True
+
+- name: Complete provisioning
+  hosts: localhost
+  gather_facts: False
+  become: False
+  tasks:
+  # AZURE: on localhost gather ip, hostname and domain name information and set the "hosts" in /api/config
+  - block:
+    - mapr_azure_hostnames.py:
+        hostvars: "{{ hostvars }}"
+      register: azure_host_info
+
+    - uri:
+        url: "{{ callback_url }}/config"
+        method: PATCH
+        body_format: json
+        body:
+          hosts: "{{ azure_host_info.fqdn_hostnames }}"
+        status_code: 200
+        user: "{{ callback_token }}"
+        password: "X"
+        validate_certs: no
+    when: provider.id == 'AZURE'
+
+  - name: Register hosts
+    uri:
+      url: "{{ callback_url }}/config"
+      method: PATCH
+      body_format: json
+      body:
+        hosts: "{{ips}}"
+      status_code: 200
+      user: "{{ callback_token }}"
+      password: "X"
+      validate_certs: no
+    when: provider.id == 'AWS' or provider.id == 'GOOGLE'
+
+  - mapr_complete.py: command="{{ command }}"

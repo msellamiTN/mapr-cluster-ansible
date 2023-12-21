@@ -1,0 +1,81 @@
+- name: Starting upgrade
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+    security: "{{ mapr.node.security|default('disabled') }}"
+    esSecurity: "{{ mapr.node.es_security|default('disabled') }}"
+
+  pre_tasks:
+  - set_fact: changingSecuritySettingMT=False
+  - set_fact: changingSecuritySetting=False
+  - name: Read existing MapR version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3}'"
+    check_mode: False
+    register: mapr_version_triple
+
+  # If we upgrade from 700 and above we don`t want to recreate moss cert. This file will indicate it.
+  - name: Put manageSSLKey flag to indicate manageSSLKeys.sh was executed before
+    ansible.builtin.file:
+      path: "{{ maprManageSSLKeyFlag }}"
+      state: touch
+      mode: u=rw,g=r,o=r
+    when: mapr_version_triple.stdout | int > 700
+
+# run custom playbook if available and enabled
+- import_playbook: preinstall.yml
+
+- import_playbook: openjdk.yml
+  vars:
+    is_upgrade: True
+
+- import_playbook: user_mapr.yml
+  vars:
+    is_upgrade: True
+
+- import_playbook: repos.yml
+
+- import_playbook: install_packages.yml
+
+- import_playbook: configure_security_controller.yml
+  vars:
+    is_upgrade: True
+  when: (security == 'master' or security == 'enabled')
+
+- import_playbook: configure.yml
+  vars:
+    is_upgrade: True
+
+# run custom playbook if available and enabled
+- import_playbook: postcoreconfigure.yml
+
+- import_playbook: start_services.yml
+
+- import_playbook: database_existing.yml
+  when: use_external_mysql
+
+- import_playbook: database_install.yml
+  when: not use_external_mysql
+
+- import_playbook: ecosystem_install.yml
+  vars:
+    is_upgrade: True
+
+- import_playbook: finalize_cluster.yml
+
+- import_playbook: ecosystem_configure.yml
+  vars:
+    is_upgrade: True
+
+- import_playbook: eco_security_controller.yml
+  when: (security == 'master' or security == 'enabled') and
+        (esSecurity == 'master' or esSecurity == 'enabled')
+
+- import_playbook: eco_keys.yml
+  when: (security == 'master' or security == 'enabled') and
+        (esSecurity == 'master' or esSecurity == 'enabled')
+
+- import_playbook: final.yml
+
+# run custom playbook if available and enabled
+- import_playbook: postecoconfigure.yml

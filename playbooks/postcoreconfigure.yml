@@ -1,0 +1,24 @@
+---
+#
+# Playbook Name:: postcoreconfigure.yml
+#
+# Copyright 2019, MapR Technologies
+#
+
+- name: Custom Post Core Configure playbook hook
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+      cpbs_disable: "{{ custom_pbs_disable|default(false) }}"
+
+  tasks:
+     - local_action: stat path="{{ maprCustomDir }}/postcoreconfigure"
+       become: false
+       register: postcoredir
+
+     - debug: var=maprCustomDir
+
+     - include_role:
+          name: postcoreconfigure
+       when: postcoredir.stat.exists and not cpbs_disable

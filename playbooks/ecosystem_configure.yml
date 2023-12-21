@@ -1,0 +1,43 @@
+---
+#
+# Playbook Name:: ecosystem
+#
+# Copyright 2017, MapR Technologies
+
+- name: Configuring MapR Ecosystem
+  hosts: all
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+    MAPR_TICKETFILE_LOCATION: "{{mapr_home}}/conf/mapruserticket"
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  vars:
+    tmp_services: "/tmp/installer_services.tgz"
+
+  tasks:
+  # Create services tarball
+  - file: path="{{ tmp_services }}" state=absent
+
+  - local_action: shell tar -C "/opt/mapr/installer/services/" -czf "{{ tmp_services }}" "."
+    become: false
+    run_once: true
+
+  - file: path="/tmp/installer/services" state=directory
+
+  - name: Copy configuration scripts
+    unarchive: src="{{ tmp_services }}" dest="/tmp/installer/services" copy=yes
+
+  - file: path="{{ tmp_services }}" state=absent
+
+  - mapr_conf.py:
+        data='{{ mapr.node|to_json }}'
+        template_dir=/tmp/installer/services/templates
+        timeout={{timeout.standard}}
+        mapr_home='{{ mapr_home }}'
+        is_update='{{ is_update | default(false) }}'
+        is_upgrade='{{ is_upgrade | default(false) }}'
+
+  - mapr_state.py: state=19

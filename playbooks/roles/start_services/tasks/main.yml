@@ -1,0 +1,79 @@
+---
+
+- stat:
+    path: "{{ mapr_home }}/conf/mapr-clusters.conf"
+  check_mode: False
+  register: mapr_configured
+
+- stat:
+    path: "{{ mapr_home }}/initscripts/mapr-warden"
+  check_mode: False
+  register: warden_present
+
+- stat:
+    path: "/etc/systemd/system/mapr-warden.service"
+  check_mode: False
+  register: warden_systemd_file_present
+
+- stat:
+    path: "{{ mapr_home }}/roles/zookeeper"
+  check_mode: False
+  register: zookeeper_present
+
+- name: Detect systemd in use
+  shell: systemctl 2>&1 | fgrep -q '.mount'
+  ignore_errors: True
+  register: systemd_in_use
+
+- debug: var=systemd_in_use
+  when: systemd_in_use is failed
+
+- name: Reload systemd
+  command: systemctl daemon-reload
+  when: systemd_in_use.rc == 0
+
+- name: Check if zookeeper running and enabled.
+  service:
+    name: mapr-zookeeper
+    enabled: yes
+    state: started
+  when: mapr_configured.stat.exists and zookeeper_present.stat.exists
+
+# copy file to detect if control hosts have changed
+- file:
+    path: "{{ mapr_home }}/installer/data"
+    state: directory
+    owner: "{{ cluster_admin_id }}"
+    group: "{{ cluster_admin_group }}"
+  check_mode: False
+
+- copy:
+    content: "ZK={{ ZOOKEEPER_HOSTS }};CLDB={{ CLDB_HOSTS }}"
+    dest: "{{ mapr_home }}/installer/data/clusters.conf"
+    owner: "{{ cluster_admin_id }}"
+    group: "{{ cluster_admin_group }}"
+  check_mode: False
+  register: clusters_file
+
+# Before starting warden, wait for ZK service to be alive.
+# This is mostly an error check, since starting warden
+# without ZK leads to strange errors.
+#
+# NOTE: this script ONLY waits when run on non-zk nodes
+# all others will return immediately
+- action: "wait_for_zk_service.sh MAX_WAIT=300 ZK_NODES={{ mapr.groups.zk|join(',') }}"
+  when: zookeeper_present.stat.exists == False and mapr_configured.stat.exists  and warden_present.stat.exists
+
+- name: Checking that warden running and enabled.
+  service:
+    name: mapr-warden
+    enabled: yes
+    state: started
+  when: mapr_configured.stat.exists and warden_present.stat.exists and not clusters_file.changed
+
+- name: Restarting warden because config changed.
+  service:
+    name: mapr-warden
+    enabled: yes
+    state: restarted
+  when: mapr_configured.stat.exists and warden_present.stat.exists and clusters_file.changed

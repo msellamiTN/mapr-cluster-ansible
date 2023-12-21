@@ -1,0 +1,11 @@
+---
+
+- mapr_state.py: state=17
+
+- name: Add new instance(s) to variable
+  add_host:
+    hostname: "{{ item }}"
+    groupname: "provisioned_ips"
+  with_items: "{{ hosts }}"
+
+- mapr_state.py: state=18

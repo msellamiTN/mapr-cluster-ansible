@@ -1,0 +1,52 @@
+---
+#
+# Playbook Name:: locale
+#
+# Copyright 2019, MapR Technologies
+#
+# This playbook set system-wide local for cluster
+#
+- name: Configuring locale for MapR cluster
+  hosts: all
+  vars:
+    lang: en_US.UTF-8
+  serial: "{{ forks }}"
+  gather_facts: True
+
+  tasks:
+  - name: Ensure LANG is set to LANG=en_US.UTF-8
+    template:
+      force: yes  # Indicate that we should overwrite file even if it existed
+      src: locale.conf.j2
+      dest: /etc/locale.conf
+      owner: root
+      group: root
+      mode: '644'
+
+  - name: Ensure LANG is set to LANG=en_US.UTF-8 in old /etc/default/locale
+    template:
+      force: yes  # Indicate that we should overwrite file even if it existed
+      src: locale.conf.j2
+      dest: /etc/default/locale
+      owner: root
+      group: root
+      mode: '644'
+
+  - name: Select default locale for deb-based via debconf
+    debconf:
+      name: locales
+      question: locales/default_environment_locale
+      value: en_US.UTF-8
+      vtype: select
+    when: ansible_os_family == 'Debian'
+
+  - name: Rebuild locales database for deb-based
+    command: "{{ item }}"
+    with_items:
+      - dpkg-reconfigure locales -f noninteractive
+      - /usr/sbin/locale-gen
+    when: ansible_os_family == 'Debian'
+
+  - name: Select default locale for CentOS7/RHEL7
+    command: "localectl set-locale LANG=en_US.UTF-8"
+    when: ansible_os_family == 'Suse' or ansible_os_family == 'RedHat'

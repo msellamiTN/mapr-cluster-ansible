@@ -1,0 +1,36 @@
+- stat: path="/opt/mapr/roles/tasktracker"
+  register: tasktrackerRole
+  check_mode: False
+
+- stat: path="/opt/mapr/initscripts/mapr-warden"
+  register: warden_present
+  check_mode: False
+
+- stat: path="/opt/mapr/roles/zookeeper"
+  register: zkRole
+  check_mode: False
+
+- name: Determining Hadoop mode (YARN vs Classic)
+  check_hadoop_version.py: mapr_user='{{ cluster_admin_id }}' timeout={{timeout.standard}}
+  register: hadoop_mode
+  check_mode: False
+
+- name: Blacklisting TaskTracker. New jobs will not be assigned to the node
+  shell: "/usr/bin/hadoop1 job -blacklist-tracker {{ansible_fqdn}}"
+  become: True
+  become_user: "{{ cluster_admin_id }}"
+  run_once: True
+  ignore_errors: True
+  when: tasktrackerRole.stat.exists and hadoop_mode.default_mode == "classic"
+
+- name: Waiting for current tasks on the node to complete
+  action: "wait_till_jobs_done.sh"
+  when: tasktrackerRole.stat.exists and wait_for_jobs
+
+- name: Stopping all MapR services
+  service: name=mapr-warden state=stopped
+  when: warden_present.stat.exists
+
+- name: Stopping Zookeeper service
+  service: name=mapr-zookeeper state=stopped
+  when: zkRole.stat.exists

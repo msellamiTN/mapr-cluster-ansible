@@ -1,0 +1,111 @@
+---
+#
+# Playbook Name:: repos_apt
+#
+# Copyright 2013, MapR Technologies
+#
+# This playbook initializes repo settings for MapR software on Debian nodes
+#
+
+- name: Configuring package repository for Debian
+  hosts: Debian
+  serial: "{{ forks }}"
+  gather_facts: False
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    repo_subdir: ""
+    repo_core_version: "trusty"
+    repo_mep_version: "trusty"
+    do_protected_repo: False
+
+  tasks:
+  - name: Get MapR version
+    set_fact:
+      mapr_version_triple: "{{ version | replace('.', '') }}"
+
+  - set_fact: repo_core_version="bionic"
+    when: mapr_version_triple | int >= 700
+
+  - set_fact: mep_version_triple={{ mep_version | regex_replace('\.','') }}
+
+  - set_fact: repo_mep_version="bionic"
+    when: mep_version_triple is version_compare('801', '>=')
+
+  - set_fact: repo_subdir=/ubuntu
+    when: not repo_full_url
+
+  - file: path=/etc/apt/sources.list.d state=directory mode=755
+
+  - apt_key: file="/tmp/gnugpg.key"
+
+  - apt_key: file="/tmp/maprgpg.key"
+
+  - shell: "rm -f /etc/apt/sources.list.d/*releases*"
+
+  - set_fact:
+      do_protected_repo: True
+    when: repo_user is defined and repo_password is defined and repo_user != "" and repo_password != ""
+
+  - template:
+      src: 99mapr
+      dest: /etc/apt/apt.conf.d
+      owner: root
+      group: root
+      mode: '660'
+    when: '"dfaf.mip.storage.hpecorp.net" in repo_core_url'
+
+  - template:
+      src: 98data_fabric
+      dest: /etc/apt/auth.conf.d/data_fabric.conf
+      owner: root
+      group: root
+      mode: '660'
+    when: do_protected_repo
+
+  - name: Checking presence for correct APT repository.
+    apt_repository:
+        repo="deb {{ repo_core_url }}{{ repo_subdir }} binary {{ repo_core_version }}"
+        state=present
+        update_cache=yes
+    ignore_errors: True
+    register: core_result
+
+  # log the failure
+  - debug: var=core_result
+    when: core_result is failed
+
+  - apt_repository:
+        repo="deb {{ repo_core_url }}{{ repo_subdir }} binary {{ repo_core_version }}"
+        state=absent
+    when: core_result is failed
+
+  - fail: msg="Unable to configure MapR Core repository. Confirm that \
+        repository target {{ repo_core_url }} is accessible"
+    when: core_result is failed
+
+  - apt_repository:
+        repo="deb {{ repo_eco_url }}{{ repo_subdir }} binary {{ repo_mep_version }}"
+        state=present
+        update_cache=yes
+    ignore_errors: True
+    register: eco_result_trusty
+
+  # log the failure
+  - debug: var=eco_result
+    when: eco_result_trusty is failed
+
+  - apt_repository:
+        repo="deb {{ repo_eco_url }}{{ repo_subdir }} binary {{ repo_mep_version }}"
+        state=absent
+        update_cache=yes
+    when: eco_result_trusty is failed
+
+  - fail: msg="Unable to configure MapR Ecosystem repository. Confirm that \
+        repository target {{ repo_eco_url }} is accessible"
+    when: eco_result_trusty is failed
+
+  - mapr_state.py: state=7

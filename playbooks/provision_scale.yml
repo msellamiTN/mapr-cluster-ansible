@@ -1,0 +1,141 @@
+---
+
+- name: Provision hosts to extend cluster
+  hosts: localhost
+  gather_facts: False
+  become: False
+  vars:
+    host_count: "{{scale_host_count}}"
+    group_id: "{{scale_group_id}}"
+    scale: True
+  tasks:
+  - debug:
+      msg: "Scale group {{group_id}} with {{host_count}} hosts"
+  roles:
+    - {role: aws, when: "provider.id == 'AWS'"}
+    - {role: azure_scale, when: "provider.id == 'AZURE'"}
+    - {role: google, when: "provider.id == 'GOOGLE'"}
+
+- name: check SSH connections
+  hosts: all
+  gather_facts: False
+  tasks:
+  # There are occasions in Azure that the VM is SSH accesable then for some reason the SSHD service is restarted
+  # which causes random failures. The workaround is to wai for all VMs to be accessable then wait a little bit and
+  # then try and access the VMs again hoping that any restart happened between the two checks.
+  - name: wait for ssh access
+    wait_for_connection:
+      delay: 10
+      sleep: 10
+      timeout: 1200
+    when: provider.id == 'AZURE'
+  - pause:
+      seconds: 10
+    when: provider.id == 'AZURE'
+
+  - wait_for_connection:
+      delay: 1
+      sleep: 2
+      timeout: 100
+
+- name: Post provision tasks
+  hosts: all
+  gather_facts: False
+  tasks:
+  - block:
+    # AZURE: on every node, gather ip, hostname and domain name information and set the information correctly in /etc/hosts
+    - setup:
+
+    - mapr_azure_hostnames.py:
+        hostvars: "{{ hostvars }}"
+      register: azure_host_info
+
+    - ansible.builtin.lineinfile:
+        dest=/etc/hosts
+        create=yes
+        backup=yes
+        line="{{ item }}"
+      with_items: "{{ azure_host_info.entries }}"
+    when: provider.id == 'AZURE'
+
+- name: Post provision tasks
+  hosts: provisioned_ips
+  gather_facts: True
+  tasks:
+  - block:
+    - name: Get ssh key
+      uri:
+        url: http://169.254.169.254/latest/meta-data/public-keys/0/openssh-key
+        return_content: yes
+      delegate_to: localhost
+      become: False
+      register: user_key
+
+    - name: Register ssh key with the nodes created
+      authorized_key:
+        user: "{{ssh_id}}"
+        key: "{{user_key['content']}}"
+    when: "provider.id == 'AWS'"
+
+  - stat: path="{{ mapr_home }}/server"
+    register: mapr_home_exists
+
+  - name: Update hostid, hostname files and reset password
+    environment:
+      MAPR_USER: "{{ cluster_admin_id }}"
+      MAPR_USER_PASSWORD: "{{ cluster_admin_password }}"
+    shell: |
+      hostname -f > hostname
+      hostid=$(server/mruuidgen)
+      echo $hostid > hostid
+      rm -f conf/hostid.*
+      echo $hostid > conf/hostid.$$
+      echo "${MAPR_USER}:${MAPR_USER_PASSWORD}" | chpasswd
+      exit $?
+    args:
+      chdir: "{{ mapr_home }}"
+    when: mapr_home_exists.stat.exists|bool == True
+
+- name: Complete provisioning
+  hosts: localhost
+  gather_facts: False
+  become: False
+  vars:
+    group_id: "{{scale_group_id}}"
+  tasks:
+  - block:
+    # now just get the hostnames for everything that is new
+    - mapr_azure_hostnames.py:
+        hostvars: "{{ hostvars }}"
+        for_ips: "{{ ips }}"
+      register: azure_new_host_info
+
+    # register the new hostnames
+    - uri:
+        url: "{{ callback_url }}/groups/{{group_id}}"
+        method: PATCH
+        body_format: json
+        body:
+          id: "{{group_id}}"
+          scaled_hosts2: "{{ azure_new_host_info.fqdn_hostnames }}"
+        status_code: 200
+        user: "{{ callback_token }}"
+        password: "X"
+        validate_certs: no
+    when: provider.id == 'AZURE'
+
+  - name: Register hosts
+    uri:
+      url: "{{ callback_url }}/groups/{{group_id}}"
+      method: PATCH
+      body_format: json
+      body:
+        id: "{{group_id}}"
+        scaled_hosts2: "{{ips}}"
+      status_code: 200
+      user: "{{ callback_token }}"
+      password: "X"
+      validate_certs: no
+    when: provider.id == 'AWS' or provider.id == 'GOOGLE'
+
+  - mapr_complete.py: command="{{ command }}"

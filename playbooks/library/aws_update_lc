@@ -1,0 +1,256 @@
+#!/usr/bin/env python
+
+from ansible.module_utils.basic import *
+import boto3
+import base64
+
+from ansible.module_utils.mapr_base import MapRBase
+
+
+class AWSLcUpdate(MapRBase):
+    def __init__(self, module=None, description="Updates AWS Launch Configuration"):
+        self.module = module
+        self.asg_name = module.params['asg_name']
+        self.disk_count = module.params['disk_count']
+        self.disk_size = module.params['disk_size']
+        self.disk_type = module.params['disk_type']
+        self.key_name = module.params['key_name']
+        self.aws_region = module.params['aws_region']
+        self.host_count = module.params['host_count']
+        self.scale = module.params['scale']
+        self.use_installer = module.params['use_installer']
+        self.use_ephemeral = module.params['use_ephemeral']
+
+    machine_ephemeral_map = {
+        "d2.xlarge": 3,
+        "d2.2xlarge": 6,
+        "d2.4xlarge": 12,
+        "d2.8xlarge": 24,
+        "i3.large": 0,
+        "i3.xlarge": 0,
+        "i3.2xlarge": 0,
+        "i3.4xlarge": 0,
+        "i3.8xlarge": 0
+    }
+    start_disk_letter = 'b'
+
+    def get_block_dev(self, instance_type):
+        vol = []
+        disk_letter = self.start_disk_letter
+        if str(instance_type).startswith("i3"):
+            self.use_ephemeral = True
+        if instance_type in self.machine_ephemeral_map and self.use_ephemeral:
+            ephemeral_disk_count = self.machine_ephemeral_map[instance_type]
+            for i in range(0, ephemeral_disk_count):
+                vol.append({'DeviceName': '/dev/sd' + disk_letter,
+                    'VirtualName': 'ephemeral' + str(i)})
+                disk_letter = chr(ord(disk_letter) + 1)
+            return vol
+
+        for x in range(0, self.disk_count):
+            if self.disk_type == 'io1':
+                vol.append({'DeviceName': '/dev/sd' + disk_letter,
+                    'Ebs': {'VolumeSize': self.disk_size,
+                        'VolumeType': self.disk_type,
+                        'Iops': self.get_io1_iops(self.disk_size),
+                        'DeleteOnTermination': True, }})
+            else:
+                vol.append({'DeviceName': '/dev/sd' + disk_letter,
+                    'Ebs': {'VolumeSize': self.disk_size,
+                        'VolumeType': self.disk_type,
+                        'DeleteOnTermination': True, }})
+            disk_letter = chr(ord(disk_letter) + 1)
+        return vol
+
+    def get_block_dev_yaml(self, spacer_length, instance_type):
+        disk_letter = self.start_disk_letter
+        spacer = ' ' * spacer_length
+        vol_str = list()
+        if str(instance_type).startswith("i3"):
+            self.use_ephemeral = True
+        if instance_type in self.machine_ephemeral_map and self.use_ephemeral:
+            ephemeral_disk_count = self.machine_ephemeral_map[instance_type]
+            if ephemeral_disk_count == 0:
+                return '\n'
+            vol_str.append(spacer + 'BlockDeviceMappings:\n')
+            for i in range(0, ephemeral_disk_count):
+                vol_str.append(
+                    spacer + '  - DeviceName: /dev/sd' + disk_letter + '\n')
+                vol_str.append(
+                    spacer + '    VirtualName: ephemeral' + str(i) + '\n')
+                disk_letter = chr(ord(disk_letter) + 1)
+        elif self.disk_count > 0:
+            vol_str.append(spacer + 'BlockDeviceMappings:\n')
+            for x in range(0, self.disk_count):
+                vol_str.append(
+                    spacer + '  - DeviceName: /dev/sd' + disk_letter + '\n')
+                vol_str.append(spacer + '    Ebs:' + '\n')
+                vol_str.append(
+                    spacer + '      VolumeType: ' + self.disk_type + '\n')
+                vol_str.append(
+                    spacer + '      VolumeSize: ' + str(self.disk_size) + '\n')
+                if self.disk_type == 'io1':
+                    vol_str.append(spacer + '      Iops: ' +
+                                   str(self.get_io1_iops(self.disk_size)) + '\n')
+                vol_str.append(spacer + '      DeleteOnTermination: True' + '\n')
+                disk_letter = chr(ord(disk_letter) + 1)
+        return vol_str
+
+    def update_lc(self, client, lc_name, lc, update_vol):
+        vol = self.get_block_dev(lc['InstanceType']) if update_vol \
+            else lc['BlockDeviceMappings']
+        user_data = base64.b64decode(lc['UserData'])
+        lc_upd = {
+            'LaunchConfigurationName': lc_name + '-mapr',
+            'ImageId': lc['ImageId'],
+            'KeyName': self.key_name,
+            'SecurityGroups': lc['SecurityGroups'],
+            'UserData': user_data,
+            'InstanceType': lc['InstanceType'],
+            'BlockDeviceMappings': vol,
+            'InstanceMonitoring': lc['InstanceMonitoring'],
+            'EbsOptimized': lc['EbsOptimized']
+        }
+        if 'KernelId' in lc and len(lc['KernelId']) > 0:
+            lc_upd['KernelId'] = lc['KernelId']
+        if 'RamdiskId' in lc and len(lc['RamdiskId']) > 0:
+            lc_upd['RamdiskId'] = lc['RamdiskId']
+        if 'IamInstanceProfile' in lc:
+            lc_upd['IamInstanceProfile'] = lc['IamInstanceProfile']
+        if 'PlacementTenancy' in lc:
+            lc_upd['PlacementTenancy'] = lc['PlacementTenancy']
+        lc_upd['AssociatePublicIpAddress'] = lc['AssociatePublicIpAddress'] \
+            if 'AssociatePublicIpAddress' in lc else False
+        client.create_launch_configuration(**lc_upd)
+        client.update_auto_scaling_group(
+            AutoScalingGroupName=self.asg_name,
+            LaunchConfigurationName=lc_name + '-mapr'
+        )
+
+    def update_cf(self, cf_name, update_vol, instance_type):
+        client = boto3.client('cloudformation', self.aws_region)
+        cfd = client.describe_stacks(StackName=cf_name)
+        new_params = list()
+        for param in cfd['Stacks'][0]['Parameters']:
+            if param['ParameterKey'] == 'keyName':
+                new_params.append({'ParameterKey': param['ParameterKey'],
+                    'ParameterValue': self.key_name})
+            else:
+                new_params.append({'ParameterKey': param['ParameterKey'],
+                    'UsePreviousValue': True})
+
+        cf = client.get_template(StackName=cf_name)
+        if update_vol:
+            cfl = cf['TemplateBody'].split('\n')
+            en = enumerate(cfl)
+            idx, line = en.next()
+            while "AWS::AutoScaling::LaunchConfiguration" not in line:
+                idx, line = en.next()
+            while "Properties" not in line:
+                idx, line = en.next()
+            idx, line = en.next()
+            asg_sp = self.get_spacer(line)
+            while self.get_spacer(line) >= asg_sp:
+                idx, line = en.next()
+            cfl[idx:idx] = self.get_block_dev_yaml(asg_sp, instance_type)
+            cf = "\n".join(cfl)
+        client.update_stack(StackName=cf_name, TemplateBody=cf,
+            Parameters=new_params)
+        waiter = client.get_waiter('stack_update_complete')
+        waiter.wait(StackName=cf_name)
+
+    def update(self):
+        client = boto3.client('autoscaling', region_name=self.aws_region)
+        asg = client.describe_auto_scaling_groups(
+            AutoScalingGroupNames=[self.asg_name]
+        )
+        cf_name = self.get_cf_name(asg)
+        lc_name = asg['AutoScalingGroups'][0]['LaunchConfigurationName']
+        old_lc = client.describe_launch_configurations(
+            LaunchConfigurationNames=[lc_name])
+        lc = old_lc['LaunchConfigurations'][0]
+        update_vol = len(lc['BlockDeviceMappings']) == 0
+        if (lc['KeyName'] != self.key_name or
+                len(lc['BlockDeviceMappings']) == 0):
+            if cf_name is not None and not self.is_aws_marketplace(asg):
+                self.update_cf(cf_name, update_vol, lc['InstanceType'])
+            else:
+                self.update_lc(client, lc_name, lc, update_vol)
+
+        min_size = asg['AutoScalingGroups'][0]['MinSize']
+        if self.scale:
+            min_size += self.host_count
+        else:
+            min_size = self.host_count
+            if self.use_installer:
+                min_size -= 1
+        self.module.exit_json(new_count=min_size)
+
+    @staticmethod
+    def get_cf_name(asg):
+        tags = asg['AutoScalingGroups'][0]['Tags']
+        for tag in tags:
+            if tag['Key'] == 'aws:cloudformation:stack-name':
+                return tag['Value']
+        return None
+
+    @staticmethod
+    def is_aws_marketplace(asg):
+        tags = asg['AutoScalingGroups'][0]['Tags']
+        for tag in tags:
+            if tag['Key'] == 'MapRTracker' and tag['Value'] == 'AWSMarketplace':
+                return True
+        return False
+
+    @staticmethod
+    def get_spacer(string):
+        i = None
+
+        for i, c in enumerate(string):
+            if c != ' ':
+                break
+        return i
+
+    @staticmethod
+    # IOPS for a disk needs to be between 100 and 64,000 but not more than 50x greater than the size of the disk
+    def get_io1_iops(size):
+        int_size = int(size)
+        iops = 50 * int_size
+
+        if iops < 100:
+            iops = 100
+        elif iops > 64000:
+            iops = 64000
+
+        return iops
+
+
+def main():
+    module = AnsibleModule(argument_spec=dict(asg_name=dict(type='str'),
+        aws_region=dict(type='str'), key_name=dict(type='str'),
+        disk_count=dict(type='int'), disk_size=dict(type='int'),
+        disk_type=dict(type='str'), host_count=dict(type='int'),
+        scale=dict(type='bool'), use_installer=dict(type='bool'),
+        use_ephemeral=dict(type='bool')))
+    m = AWSLcUpdate(module)
+    m.update()
+
+
+main()
+
+# params = {
+#     "asg_name": "nst-analytics-ClusterNodes-1TCY41H10PKMJ",
+#     "aws_region": "us-east-2",
+#     "key_name": "nst-analytics-a7d246fa",
+#     "disk_count": 1,
+#     "disk_size": 100,
+#     "disk_type": "gp2",
+#     "host_count": 1,
+#     "scale": False,
+#     "use_installer": False,
+#     "use_ephemeral": False
+# }
+#
+# from maprinstaller.MockAnsibleModule import MockAnsibleModule
+# aws = AWSLcUpdate(MockAnsibleModule(params))
+# aws.update()

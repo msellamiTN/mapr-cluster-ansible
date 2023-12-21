@@ -1,0 +1,17 @@
+---
+#
+# Playbook Name:: Stop services
+#
+# Copyright 2017, MapR Technologies
+#
+
+- name: Stop instances
+  hosts: all
+  gather_facts: no
+  roles:
+    - stop_services
+  tasks:
+  - name: "Shutting down AWS node"
+    shell: service mapr-installer status > /dev/null 2>&1 || nohup bash -c "sleep 10; shutdown -P now" &
+    ignore_errors: true
+    when: provider is defined and provider.id == 'AWS'

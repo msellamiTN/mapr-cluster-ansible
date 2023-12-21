@@ -1,0 +1,5 @@
+[mapr_core]
+enabled=1
+autorefresh=1
+baseurl={{ repo_core }}{{ repo_subdir }}
+gpgcheck=1

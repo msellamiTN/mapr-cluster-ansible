@@ -1,0 +1,23 @@
+---
+#
+# Playbook Name:: install_mapr
+#
+# Copyright 2013, MapR Technologies
+#
+# Run with
+#    ansible-playbook <playbook>
+# on a local system, or
+#    ansible-playbook <playbook> -e "cloud_user=ec2-user" -e "cloud_connection=ssh"
+# when accessing remote systems (for example in the Amazon cloud)
+#
+
+- name: Install and configure MapR software
+  hosts: all
+  serial: "{{ forks }}"
+
+- import_playbook: install_packages.yml
+- import_playbook: configure.yml
+- import_playbook: disksetup.yml
+- import_playbook: start_services.yml
+- import_playbook: finalize_cluster.yml
+

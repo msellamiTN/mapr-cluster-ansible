@@ -1,0 +1,135 @@
+---
+#
+# Playbook Name:: local_repos
+#
+# Copyright 2013, MapR Technologies
+#
+# This playbook initializes the repository specifications for the
+# MapR software.   It MUST be run before the attempt to install
+# packages is made.
+#
+# If the "makecache" operation fails, we EXPLICITLY delete the
+# repository specification files so that the next pass through
+# this playbook will work properly.
+#
+# DIFFERENCES FROM repos.yml
+# ------------------------
+#    Configure fully specified MapR Core repostories (rather
+#    than based of known structure of http://packages.mapr.com)
+#
+#    The expected syntax in the manifest file will be
+#        "mapr_core_url" : "file:///var/packages/mapr"
+#    for a local copy, or
+#        "mapr_core_url" : "http://nearbyhost.mydomain.com/mapr/VersionX"
+#    for a copy on a local web server
+#
+# Run with
+#    ansible-playbook <playbook>
+# on a local system, or
+#    ansible-playbook <playbook> -e "cloud_user=ec2-user" -e "cloud_connection=ssh"
+# when accessing remote systems (for example in the Amazon cloud)
+#
+
+- name: Initializing MapR package repository
+  hosts: all
+  serial: "{{ forks|default(20) }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    this_distro: ansible_distribution
+    version: "v{{ version }}"
+    core_url: "{{ repo_core_url }}"
+    eco_url: "{{ repo_eco_url }}"
+
+  tasks:
+  - name: Setting repository for Debian system
+    apt_repository: repo="deb {{ repo_core_url }} /" state=present update_cache=yes
+    register: apt_core_result
+    ignore_errors: True
+    when: ansible_os_family == 'Debian'
+
+  # log the output if it failed
+  - debug: var=apt_core_result
+    when: apt_core_result is failed
+
+  - name: Removing *mapr*.list from /etc/apt/sources.list.d/
+    action: "shell rm -f /etc/apt/sources.list.d/*mapr*.list"
+    when: apt_core_result is failed
+  - fail: msg="Unable to properly configure MapR Core repository"
+    when: apt_core_result is failed
+
+  - name: Adding new eco repo 
+    apt_repository: repo="deb {{ repo_eco_url }}/ubuntu binary/" state=present update_cache=yes
+    register: apt_eco_result
+    ignore_errors: True
+    when: ansible_os_family == 'Debian'
+
+  # log the output if it failed
+  - debug: var=apt_eco_result
+    when: apt_eco_result is failed
+
+  - action: "shell rm -f /etc/apt/sources.list.d/*mapr*.list"
+    when: apt_eco_result is failed
+  - fail: msg="Unable to properly configure MapR Ecosystem repository"
+    when: apt_eco_result is failed
+
+  - ini_file: dest=/etc/yum.repos.d/mapr_core.repo
+      section='MapR_Core'
+      option="{{ item.key }}"
+      value="{{ item.value }}"
+      state=present
+    with_items:
+            - key: 'name'
+              value: "MapR Core components"
+            - key: 'baseurl'
+              value: "{{ repo_core_url }}/"
+            - key: 'gpgcheck'
+              value: "0"
+            - key: 'enabled'
+              value: "1"
+            - key: 'protected'
+              value: "1"
+    when: ansible_os_family == 'RedHat'
+
+  - ini_file: dest=/etc/yum.repos.d/mapr_ecosystem.repo
+              section='MapR_Ecosystem'
+              option="{{ item.key }}"
+              value="{{ item.value }}"
+              state=present
+    with_items:
+            - key: 'name'
+              value: "MapR Ecosystem components"
+            - key: 'baseurl'
+              value: "{{ repo_eco_url }}/redhat"
+            - key: 'gpgcheck'
+              value: "0"
+            - key: 'enabled'
+              value: "1"
+            - key: 'protected'
+              value: "1"
+    when: ansible_os_family == 'RedHat'
+
+  # We should be smarter here and only run makecache when
+  # the repositories actualy change.
+  - command: yum makecache -y
+    register: yum_makecache_result
+    ignore_errors: True
+    when: ansible_os_family == 'RedHat'
+
+  # log the output if it failed
+  - debug: var=yum_makecache_result
+    when: yum_makecache_result is failed
+
+  - action: "shell rm -f /etc/yum.repos.d/mapr_*.repo"
+    when: yum_makecache_result is failed
+  - fail: msg="Unable to properly configure MapR repositories"
+    when: yum_makecache_result is failed
+
+  - debug: msg="MAPR_HOME set to {{ mapr_home }} "
+    when: mapr_debug is defined
+
+  - debug: msg="MAPR_VERSION set to {{ version }} "
+    when: mapr_debug is defined

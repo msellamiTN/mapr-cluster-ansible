@@ -1,0 +1,16 @@
+---
+# Stop(deallocate) Azure nodes using the Azure API on the localhost
+
+- name: Stop and deallocate instances Azure
+  hosts: localhost
+  gather_facts: no
+  become: False
+  tasks:
+  - mapr_azure_shutdown.py:
+      auth_type: service_principal
+      subscription_id: "{{ provider.config.subscription_id }}"
+      tenant: "{{ provider.config.tenant_id }}"
+      client_id: "{{ provider.config.client_id }}"
+      secret: "{{ provider.encryptedConfig.secret }}"
+      resource_group: "{{ provider.config.resource_group }}"
+    when: provider is defined and provider.id is defined and provider.id == 'AZURE'

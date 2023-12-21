@@ -1,0 +1,42 @@
+---
+#
+# Playbook Name:: check
+#
+# Copyright 2017, MapR Technologies
+#
+# Run with
+#    ansible-playbook <playbook>
+# on a local system, or
+#    ansible-playbook <playbook> -e "cloud_user=ec2-user" -e "cloud_connection=ssh"
+# when accessing remote systems (for example in the Amazon cloud)
+#
+
+
+- name: Validating Services
+  gather_facts: True
+  hosts: all
+  max_fail_percentage: 80
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+    LANG: "en_US.UTF-8"
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  tasks:
+    - fail: msg="Timeout {{item}} invalid, must be an integer >= 0. Please check group_vars/all"
+      when: item|int(-1) < 0
+      with_items:
+      - "{{timeout.standard}}"
+      - "{{timeout.configure}}"
+
+
+    - name: Verify Services
+      mapr_verify_services.py:
+        admin_group='{{ cluster_admin_group }}'
+        admin_user='{{ cluster_admin_id }}'
+        data='{{ mapr.node|to_json }}'
+        timeout='{{ timeout.standard }}'
+        env_variables='{{ mapr.node.variables|to_json }}'
+        home={{mapr_home}}

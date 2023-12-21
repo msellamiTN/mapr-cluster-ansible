@@ -1,0 +1,28 @@
+---
+#
+# Playbook Name:: os_base
+#
+# Copyright 2013, MapR Technologies
+#
+# Run with
+#    ansible-playbook <playbook>
+# on a local system, or
+#    ansible-playbook <playbook> -e "cloud_user=ec2-user" -e "cloud_connection=ssh"
+#
+
+- name: Configuring OS prerequisites
+  hosts: all
+  serial: "{{ forks }}"
+
+  tasks:
+  - name: Determine cloud status
+    set_fact: is_cloud={{ True if provider is defined else False }}
+
+  - name: Group by OS family
+    group_by: key={{ ansible_os_family }}
+
+# Be careful ... these include directives need to be at 
+# the same indentation level as the above "- name:" directive
+- import_playbook: os_base_debian.yml
+- import_playbook: os_base_redhat.yml
+- import_playbook: os_base_suse.yml

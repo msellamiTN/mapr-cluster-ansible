@@ -1,0 +1,296 @@
+---
+#
+# Playbook Name:: Add new control/multimaster nodes to existing nodes
+#
+# Copyright 2017, MapR Technologies
+#
+#
+
+- name: Tasks to run on old nodes after extend cluster
+  hosts: all
+  serial: "{{ forks }}"
+  gather_facts: True
+
+  environment:
+    PATH: /bin:/sbin:/usr/bin:/usr/sbin:{{ ansible_env.PATH }}
+
+  vars:
+    maprloopbacknfsHome: "/usr/local/mapr-loopbacknfs"
+    maprloopbacknfsConf: "{{ maprloopbacknfsHome }}/conf"
+    loopbacknfsEnvFile: "{{ maprloopbacknfsConf }}/env.sh"
+    maprConf: "{{ mapr_home }}/conf"
+    cConfFile: "{{ maprConf }}/mapr-clusters.conf"
+    loopbacknfscConfFile: "{{ maprloopbacknfsConf }}/mapr-clusters.conf"
+    maprFstabFile: "{{ maprConf }}/mapr_fstab"
+    loopbacknfsFstabFile: "{{ maprloopbacknfsConf }}/mapr_fstab"
+    envOverrideFile: "{{ maprConf }}/env_override.sh"
+    wConfFile: "{{ maprConf }}/warden.conf"
+    user_ticket_file: "{{ maprConf }}/mapruserticket"
+    security: "{{ mapr.node.security|default('disabled') }}"
+    diskEncryption: "{% if enable_encryption_at_rest|default(False) %}1{% else %}0{% endif %}"
+    meteringMinConfig: "{% if enable_min_metrics_collection|default(False) %}1{% else %}0{% endif %}"
+    wOverCommitLimit: 65536
+    externalPattern: "(^.*)({{ ansible_nodename }}):((([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5]))($|,.*$)"
+    cldbNodes: "{{ mapr.groups.cldb }}"
+    nfsRoleFile: "{{ mapr_home }}/roles/nfs"
+    nfs4RoleFile: "{{ mapr_home }}/roles/nfs4"
+    loopbacknfsRoleFile: "{{ maprloopbacknfsHome }}/roles/loopbacknfs"
+    isUpdate: "{{ is_update | default(false) }}"
+    zkNodes: "{{ mapr.groups.zk }}"
+    numExistingCldbs: 0
+    numExistingZks: 0
+    controlGroupChanged: False
+    configureSSOKeycloak: "{% if sso_keycloak|default(False) %}1{% else %}0{% endif %}"
+    roles_only: 1
+    no_auto_start: 0
+    tmp_services: "/tmp/installer_services.tgz"
+    tmp_services_dir: "/tmp/installer/services"
+
+  tasks:
+
+  - name: "Make sure service tar ball does not exist"
+    file: path="{{ tmp_services }}" state=absent
+
+  - name: "create service tar ball"
+    local_action: shell tar -C "/opt/mapr/installer/services/" -czf "{{ tmp_services }}" "."
+    become: false
+    run_once: true
+
+  - name: "create the {{ tmp_services_dir }} directory"
+    file: path="{{ tmp_services_dir }}" state=directory
+
+  - name: "Copy configuration scripts"
+    unarchive: src="{{ tmp_services }}" dest="{{ tmp_services_dir }}" copy=yes
+
+  - name: "Remove the services tar ball"
+    file: path="{{ tmp_services }}" state=absent
+
+  - name: Check if warden.conf exists
+    stat: path="{{ wConfFile }}"
+    register: warden_conf
+    check_mode: False
+
+  - name: get 4 digit version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3$4}'"
+    register: mapr_build_version
+
+  - set_fact: mapr_version_quadruple={{ mapr_build_version.stdout }}
+
+  - block:
+    - set_fact: roles_only=0
+
+    - set_fact: no_auto_start=1
+
+    - name: Check if mapr-clusters.conf exists
+      stat: path="{{ cConfFile }}"
+      register: cluster_conf
+      check_mode: False
+
+    - name: Check if env_override.sh exists
+      stat: path="{{ envOverrideFile }}"
+      register: env_override_file
+      check_mode: False
+
+    - name: Add MAPR_SUBNETS to env_override.sh
+      ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_SUBNETS=' line="export MAPR_SUBNETS={{ mapr_subnet }}"
+      when: mapr_subnet is defined
+
+    - name: Remove MAPR_SUBNETS from env_override.sh
+      ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_SUBNETS=' line=""
+      when: mapr_subnet is not defined and env_override_file.stat.exists
+
+    - name: Add MAPR_RDMA_SUPPORT to env_override.sh
+      ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_RDMA_SUPPORT=' line="export MAPR_RDMA_SUPPORT=false"
+      when: mapr_version_quadruple|int>= 6200 and mapr_version_quadruple|int < 6202
+
+    - name: Remove MAPR_RDMA_SUPPORT from env_override.sh
+      ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_RDMA_SUPPORT=' line=""
+      when: (mapr_version_quadruple|int < 6200 or mapr_version_quadruple|int >= 6202) and env_override_file.stat.exists
+
+    - debug: var=externalPattern
+  
+    - debug: var=mapr_external
+      when: mapr_external is defined
+  
+    - name: Find my MAPR_EXTERNAL address
+      set_fact: my_mapr_external="{{ mapr_external | regex_replace(externalPattern,'\\3') }}"
+      when: mapr_external is defined 
+  
+    - debug: var=my_mapr_external
+  
+    - name: Add MAPR_EXTERNAL to env_override.sh
+      ansible.builtin.lineinfile: state=present create=yes path="{{ envOverrideFile }}" regexp='^export MAPR_EXTERNAL=' line="export MAPR_EXTERNAL={{ my_mapr_external }}"
+      when: mapr_external is defined and my_mapr_external is defined and my_mapr_external != mapr_external
+  
+    - name: Remove MAPR_EXTERNAL from env_override.sh
+      ansible.builtin.lineinfile: path="{{ envOverrideFile }}" regexp='^export MAPR_EXTERNAL=' line=""
+      when: mapr_external is not defined and env_override_file.stat.exists
+
+    - name: remember number of configured ZKs
+      set_fact: numZks="{{ zkNodes|length }}"
+
+    - name: remember number of configured CLDBs
+      set_fact: numCldbs="{{ cldbNodes|length }}"
+
+    - block:
+      - name: compute number of existing ZKs
+        shell: "fgrep zookeeper {{ wConfFile }} | cut -d= -f2 | tr ',' '\n' | wc -l"
+        register: existingZks
+
+      - set_fact: numExistingZks="{{ existingZks.stdout }}"
+
+      - name: figure out if this node already had ZK configured
+        shell: "fgrep zookeeper {{ wConfFile }} | fgrep {{ ansible_nodename }}"
+        ignore_errors: True
+        register: existingZkOnMyNode
+
+      when:  warden_conf.stat.exists
+  
+    - block:
+        - name: compute number of existing CLDBs
+          shell: "cat {{ cConfFile }} | head -n 1 | cut --complement -d' ' -f1 |
+               sed -e 's/[a-zA-Z]*=[a-zA-Z]* //g;s/[a-zA-Z]*=[0-9]* //g' |
+               tr ' ' '\n' | wc -l"
+          register: existingCldbs
+
+        - set_fact: numExistingCldbs="{{ existingCldbs.stdout }}"
+
+        - name: figure out if this node already had CLDB configured
+          shell: "cat {{ cConfFile }} | head -n 1 | grep {{ ansible_nodename }}"
+          ignore_errors: True
+          register: existingCldbOnMyNode
+
+      when:  cluster_conf.stat.exists
+
+    - name: determine if controlGroup changed
+      set_fact: controlGroupChanged=True
+      when: numExistingCldbs != numCldbs or numExistingZks != numZks
+
+    when: scaled_dict is defined and scaled_dict['control']
+
+  # enable overcommit for warden to allow services to start on low mem machines
+  - ansible.builtin.lineinfile:
+        dest="{{ wConfFile }}"
+        line="enable.overcommit=true"
+        state=present
+    when: warden_conf.stat.exists|bool == True and ansible_memtotal_mb < wOverCommitLimit
+
+
+  - name: "Running do_configure.sh from 'configure_add.yml'"
+    do_configure.sh: MAPR_HOME={{ mapr_home }}
+      MAPR_USER={{ cluster_admin_id }}
+      MAPR_GROUP={{ cluster_admin_group }}
+      CLUSTERNAME={{ cluster_name }}
+      CLDBNODES={{ mapr.groups.cldb|join(',') }}
+      ZKNODES={{ mapr.groups.zk|join(',') }}
+      HISTORYSERVER_HOST={{ HISTORYSERVER_HOST|default('') }}
+      TIMELINESERVER_HOST={{ TIMELINESERVER_HOST|default('') }}
+      HMNODES={{ HIVEMETASTORE_HOSTS|default('') }}
+      ESNODES={{ ELASTICSEARCH_HOSTS|default('') }}
+      ES_DB={{ elasticsearch_path|default('') }}
+      ES_PW={{ log_admin_password|default('') }}
+      GRAFANA_PW="{% if security == 'disabled' %}{{ metrics_ui_admin_password|default('') }}{% else %}{{ cluster_admin_password }}{% endif %}"
+      METRICS_DATABASE_HOST={{ mapr.node.db.metrics_db_host }}
+      METRICS_DATABASE_PORT={{ mapr.node.db.metrics_db_port }}
+      METRICS_DATABASE_USER={{ mapr.node.db.metrics_db_user }}
+      METRICS_DATABASE_PASSWORD={{ mapr.node.db.metrics_db_password }}
+      METRICS_DATABASE_NAME={{ mapr.node.db.metrics_db_name }}
+      OTNODES={{ OPENTSDB_HOSTS|default('') }}
+      DARE={{ diskEncryption }}
+      METERING_CONFIG_ONLY={{ meteringMinConfig }}
+      SECURITY={{ security }}
+      YARN={{ True }}
+      CONTROL_GROUP_CHANGED="{% if controlGroupChanged %}1{% else %}0{% endif %}"
+      SSO_KEYCLOAK={{ configureSSOKeycloak }}
+      LICENSE_MODULES={{ license_modules|join(',') }}
+      LICENSE_TYPE={{ license_type }}
+      RESTART_ECO=0
+      REFRESH_ROLES={{ roles_only }}
+      NOAUTO_START={{ no_auto_start }}
+      TIMEOUT_CONFIGURE={{timeout.configure}}
+      TIMEOUT_MAPRCLI={{timeout.standard}}
+    when: scaled_dict is defined and (scaled_dict['control'] or scaled_dict['server'])
+    register: do_configure_result
+    ignore_errors: True
+
+  - set_fact: configure_log="{{ do_configure_result.mapr_logs | regex_search(cfg_log_regexp,'\\3') }}"
+    when: do_configure_result.mapr_logs is defined and not do_configure_result is not skipped
+     
+  - debug: var=do_configure_result.mapr_logs
+  - debug: var=configure_log
+
+  - fetch: src='{{ configure_log[0] }}' dest='{{log_dir}}/{{ ansible_nodename }}_{{ configure_log[0].split('/')[-1] }}' flat=yes validate_checksum=no
+    when: do_configure_result.mapr_logs is defined and not do_configure_result is not skipped and
+          configure_log is defined and configure_log|length > 0
+    register: configure_log_fetched
+
+  - file: path="{{ configure_log[0] }}" state=absent
+    when: configure_log_fetched is succeeded and configure_log_fetched is not skipped
+
+  - fail: msg="{{ do_configure_result.msg }} from 'configure_add.yml'; check
+        {{ mapr_home }}/logs/configure.log"
+    when: do_configure_result is failed
+
+  - stat: path="{{ nfsRoleFile }}"
+    register: nfs_role_file
+    check_mode: False
+
+  - stat: path="{{ nfs4RoleFile }}"
+    register: nfs4_role_file
+    check_mode: False
+
+  - stat: path="{{ loopbacknfsRoleFile }}"
+    register: loopbacknfs_role_file
+    check_mode: False
+
+  - stat: path=/mapr
+    register: nfs_mount_dir
+    check_mode: False
+    ignore_errors: yes
+
+  - file: path=/mapr state=directory group="root" owner="root"
+    when: (nfs_role_file.stat.exists|bool == True or nfs4_role_file.stat.exists|bool == True or
+           loopbacknfs_role_file.stat.exists|bool == True) and
+          nfs_mount_dir is defined and nfs_mount_dir.stat is defined and
+          nfs_mount_dir.stat.exists|bool == False
+
+  - ansible.builtin.lineinfile:
+        dest="{{ maprConf }}/mapr_fstab"
+        line="localhost:/mapr /mapr soft,intr,nolock"
+        create=yes
+        state=present
+        mode=0644
+    when: nfs_role_file.stat.exists|bool == True or nfs4_role_file.stat.exists|bool == True or
+          loopbacknfs_role_file.stat.exists|bool == True
+
+  - name: Configure loopbacknfs
+    block:
+      - shell: ". {{ maprConf }}/env.sh && echo $JAVA_HOME"
+        register: java_home_result
+
+      - debug: var=java_home_result
+
+      - command: "mv {{ loopbacknfscConfFile }} {{ loopbacknfscConfFile }}.orig"
+        ignore_errors: yes
+
+      - file: src="{{ cConfFile }}" dest="{{ loopbacknfscConfFile }}" state=link
+
+      - file: src="{{ maprFstabFile }}" dest="{{ loopbacknfsFstabFile }}" state=link
+
+      - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export MAPR_HOME=' line="export MAPR_HOME={{ maprloopbacknfsHome }}"
+      - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export JAVA_HOME=' line="export JAVA_HOME={{ java_home_result.stdout }}"
+      - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export MAPR_TICKETFILE_LOCATION=' line="export MAPR_TICKETFILE_LOCATION={{ user_ticket_file }}"
+      - block:
+        - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export NFS_LOOPBACK_HONOUR_SUBNETS=' line="export NFS_LOOPBACK_HONOUR_SUBNETS=true"
+        - ansible.builtin.lineinfile: state=present create=yes path="{{ loopbacknfsEnvFile }}" regexp='^export MAPR_SUBNETS=' line="export MAPR_SUBNETS={{ mapr_subnet }}"
+        when: mapr_subnet is defined
+
+    when: loopbacknfs_role_file.stat.exists|bool == True
+
+  - block:
+    - name: "restart zk if control group changed"
+      service: name=mapr-zookeeper enabled=yes state=restarted
+    
+    - name: "restart warden if control group changed"
+      service: name=mapr-warden enabled=yes state=restarted
+    when: controlGroupChanged

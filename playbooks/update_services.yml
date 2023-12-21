@@ -1,0 +1,33 @@
+- name: Starting maintenance update
+  hosts: all
+  serial: "{{ forks }}"
+
+  pre_tasks:
+  - set_fact: changingSecuritySettingMT=False
+  - set_fact: changingSecuritySetting=False
+
+# run custom playbook if available and enabled
+- import_playbook: preinstall.yml
+
+- import_playbook: repos.yml
+
+- import_playbook: install_packages.yml
+
+- import_playbook: configure_security_controller.yml is_upgrade=True
+  when: (security == 'master' or security == 'enabled')
+
+- import_playbook: configure.yml
+  vars:
+    is_update: true
+    is_upgrade: false
+
+# run custom playbook if available and enabled
+- import_playbook: postcoreconfigure.yml
+
+- import_playbook: start_services.yml
+
+- import_playbook: finalize_cluster.yml
+  vars:
+    is_update: true
+
+- import_playbook: final.yml

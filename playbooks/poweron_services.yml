@@ -1,0 +1,32 @@
+---
+#
+# Playbook Name:: Start Mapr cluster
+#
+# Copyright 2017, MapR Technologies
+#
+
+- name: Start Cloud nodes
+  hosts: localhost
+  gather_facts: no
+  become: False
+  tasks:
+  - include_role:
+      name: aws_start_stop
+    vars:
+      current_state: stopped
+    when: provider is defined and provider.id is defined and provider.id == 'AWS'
+
+  - include_role:
+      name: azure_start
+    vars:
+      current_state: stopped
+    when: provider is defined and provider.id is defined and provider.id == 'AZURE'
+
+- name: Start Mapr cluster services
+  hosts: all
+  gather_facts: no
+  tasks:
+  - include_role:
+      name: start_services
+
+  - mapr_complete.py: command="{{ command }}"

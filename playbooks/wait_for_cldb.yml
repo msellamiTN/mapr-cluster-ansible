@@ -1,0 +1,12 @@
+- name: Wait for CLDB before disk setup
+  hosts: all
+  serial: "{{ forks|default(20) }}"
+  gather_facts: False
+
+  tasks:
+  - name: wait for a CLDBs
+    wait_for:
+        host: "{{ mapr.groups.cldb[0] }}"
+        port: 7222
+        sleep: 5
+        timeout: 600

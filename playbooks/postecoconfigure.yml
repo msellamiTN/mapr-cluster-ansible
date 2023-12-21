@@ -1,0 +1,22 @@
+---
+#
+# Playbook Name:: postecoconfigure.yml
+#
+# Copyright 2019, MapR Technologies
+#
+
+- name: Custom Post Eco Configure playbook hook
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+      cpbs_disable: "{{ custom_pbs_disable|default(false) }}"
+
+  tasks:
+     - local_action: stat path="{{ maprCustomDir }}/postecoconfigure"
+       become: false
+       register: postecodir
+
+     - include_role:
+          name: postecoconfigure
+       when: postecodir.stat.exists and not cpbs_disable

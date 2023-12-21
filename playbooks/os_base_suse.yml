@@ -1,0 +1,228 @@
+---
+#
+# Playbook Name:: os_base_suse
+#
+# Copyright 2013, MapR Technologies
+#
+#       Sub-section of os_base.yml
+#
+# TODO: refactor install logic to use ansible zypper module, not shell/command
+
+- name: Configuring OS prerequisites
+  hosts: Suse
+  serial: "{{ forks }}"
+  gather_facts: False
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    mapr_suse_prereqs: "ca-certificates, cron, curl, device-mapper, gpg2, iputils,\
+      libcap-progs, libfreebl3, libpcre1, lsof, lvm2, mozilla-nss, netcat,\
+      sudo, sysfsutils, syslinux, sysstat, util-linux, wget, coreutils"
+    mapr_suse12_prereqs: "libopenssl1_0_0, python-rpm, sdparam, python-xml"
+    mapr_suse15_prereqs: "libfl2, libopenssl1_0_0, libopenssl1_1, libibverbs, librdmacm, python3-devel, 
+      python3-rpm, python3-xml, rdma-ndd, rdma-core, sg3_utils, sysvinit-tools, python3-rpm"
+    mapr_suse15_prereqs_python2_obsolete: "python2-rpm, python-xml"
+    mapr_suse_prereqs1: "libfreebl3-hmac"
+    mapr_suse_prereqs2: "nfs-client"
+    mapr_suse_ntp_daemons:
+      - ntpd
+      - ntp
+      - chrony
+    swap_val: 0
+
+  tasks:
+
+  - set_fact: swap_val=1
+    when: ansible_kernel is version_compare('2.6.32', '>')
+
+  - set_fact: mapr_suse_prereqs="{{mapr_suse_prereqs }}, {{ mapr_suse12_prereqs }}"
+    when: ansible_distribution_version is version_compare('12', '<=')
+
+  - set_fact: mapr_suse_prereqs="{{mapr_suse_prereqs }}, {{ mapr_suse15_prereqs }}"
+    when: ansible_distribution_version is version_compare('15', '>=')
+
+  - set_fact: mapr_suse_prereqs="{{mapr_suse_prereqs }}, {{ mapr_suse15_prereqs_python2_obsolete }}"
+    when: ansible_distribution_version is version_compare('12', '<=')
+
+  - command: zypper --no-gpg-checks --non-interactive refresh
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: zypper_refresh is succeeded
+    register: zypper_refresh
+
+
+  # if gettext-runtime-mini is installed sysstat will fail to install
+  # try to upgrade it to full gettext-runtime package
+  - shell: rpm -qa | grep 'gettext-runtime-mini'
+    register: gettext_mini_installed
+    ignore_errors: True
+
+  - shell: |
+      zypper --non-interactive install --force-resolution --type package \
+      --auto-agree-with-licenses --no-recommends -- gettext-runtime
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: gettext_runtime_upgrade
+    until: gettext_runtime_upgrade is succeeded
+    ignore_errors: True
+
+  - fail: msg="gettext-runtime-mini is installed - failied to upgrade - replace it with gettext-runtime"
+    when: gettext_runtime_upgrade is failed
+
+  # SUSE distributions need an extra package (nc)
+  # to avoid pulling in the suse-compat package incorrectly
+  - shell: |
+      zypper --non-interactive install --type package \
+      --auto-agree-with-licenses --no-recommends -- \
+      {{ mapr_suse_prereqs | regex_replace(',',' ') }}
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: zypper_prereqs is succeeded
+    register: zypper_prereqs
+    ignore_errors: True
+
+  - fail: msg="Prereq packages failed to install. Please fix the errors reported by zypper and then retry. If Leap 42.3 repository is enabled, please disable during the installation."
+    when: zypper_prereqs is failed
+
+  # we know for sure that the 3.29 version of libfreebl3 does not work without also installing
+  # version numbers look like 3.19, 3.20, 3.28 etc
+  - shell: rpm -qa | grep libfreebl3 | cut -d'-' -f2 | cut -d'.' -f2
+    register: libfreebl_ver
+
+  - shell: |
+      zypper --non-interactive install --type package \
+      --auto-agree-with-licenses --no-recommends -- \
+      {{ mapr_suse_prereqs1 }}
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: zypper_prereqs1 is succeeded
+    register: zypper_prereqs1
+    when: libfreebl_ver is defined and libfreebl_ver.stdout is version_compare('29', '>=') and
+          ansible_distribution_version is version_compare('12', '<=')
+
+
+
+  # we need to install nfs-client only if it is not already installed, otherwise we get in trouble due to
+  # service pack refreshses where the installed server version is different than the new client versions
+  # zypper wants to pull in
+  - shell: rpm -qa | grep {{ mapr_suse_prereqs2 }}
+    register: nfs_client_installed
+    ignore_errors: True
+
+
+  - shell: |
+      zypper --non-interactive install --type package \
+      --auto-agree-with-licenses --no-recommends -- \
+      {{ mapr_suse_prereqs2 }}
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: zypper_prereqs2 is succeeded
+    register: zypper_prereqs2
+    when: nfs_client_installed is not defined  or nfs_client_installed is failed
+
+  # Other helpful packages ... but not critical
+  - zypper:
+      name: clustershell,ethtool,pdsh
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: zypper_clush_install is succeeded
+    register: zypper_clush_install
+    ignore_errors: True
+
+  - shell: pam-config --add --limits
+
+  - sysctl: name="net.ipv4.tcp_retries2" value=5 state=present ignoreerrors=yes
+
+  - sysctl: name=vm.overcommit_memory value=0 state=present ignoreerrors=yes
+
+  - sysctl: name=vm.swappiness value={{ swap_val }} state=present ignoreerrors=yes
+
+  - service: name=rpcbind enabled=yes state=started
+
+  - name: Check to see if any of the ntp daemons are installed
+    shell: rpm -qa | grep "{{ item }}-" | grep -v yast
+    ignore_errors: True
+    register: ntp_daemons_installed
+    with_items: "{{ mapr_suse_ntp_daemons }}"
+
+  - debug: var=ntp_daemons_installed
+
+  - name: determine which ntp daemon is installed
+    set_fact:
+      ntp_daemon_installed: "{%if item.stdout_lines|length > 0 %}{{ item.stdout_lines[0]|regex_replace('-.*','') }}{%endif%}"
+    when: item.stdout_lines|length > 0
+    with_items: "{{ ntp_daemons_installed.results }}"
+
+  - debug: var=ntp_daemon_installed
+
+  - block:
+    - block:
+      - name: install chrony if no ntp daemon installed
+        zypper:
+          name: chrony
+          state: latest
+        retries: "{{ package_manager_retries }}"
+        delay: "{{ package_manager_delay_sec }}"
+        until: zypper_chrony_install is succeeded
+        register: zypper_chrony_install
+
+      - name: remember we installed chrony
+        set_fact: ntp_daemon_installed=chrony
+
+      when: ntp_daemon_installed is not defined
+    when: ansible_distribution_version is version_compare('15', '>=')
+
+  - block:
+    - block:
+      - name: install ntp if no ntp daemon installed
+        zypper:
+          name: ntp
+          state: latest
+        retries: "{{ package_manager_retries }}"
+        delay: "{{ package_manager_delay_sec }}"
+        until: zypper_ntp_install is succeeded
+        register: zypper_ntp_install
+
+      - name: remember we installed ntp
+        set_fact: ntp_daemon_installed=ntp
+
+      when: ntp_daemon_installed is not defined
+    when: ansible_distribution_version is version_compare('12', '<')
+
+  - block:
+    - block:
+      - name: install ntp if no ntp daemon installed
+        zypper:
+          name: ntp
+          state: latest
+        retries: "{{ package_manager_retries }}"
+        delay: "{{ package_manager_delay_sec }}"
+        until: zypper_ntp2_install is succeeded
+        register: zypper_ntp2_install
+
+      - name: remember we installed ntp
+        set_fact: ntp_daemon_installed=ntp
+
+      when: ntp_daemon_installed is not defined
+    when: ansible_distribution_version is version_compare('12', '>=') and
+          ansible_distribution_version is version_compare('15', '<')
+
+  - name: Restarting chrony
+    service: name=chronyd state=started enabled=yes
+    when: ntp_daemon_installed == 'chrony'
+
+  - name: Restarting ntp
+    service: name=ntp state=started enabled=yes
+    when: ntp_daemon_installed == 'ntp' and ansible_distribution_version is version_compare('12', '<')
+
+  - name: Restarting ntpd
+    service: name=ntpd state=started enabled=yes
+    when: (ntp_daemon_installed == 'ntpd' or ntp_daemon_installed == 'ntp') and
+          ansible_distribution_version is version_compare('12', '>=')
+
+  - mapr_state.py: state=2
+

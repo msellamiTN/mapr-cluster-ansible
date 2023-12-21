@@ -1,0 +1,218 @@
+---
+#
+# Playbook Name:: mapr_top
+#
+# Copyright 2013, MapR Technologies
+#
+# Run with
+#    ansible-playbook <playbook>
+
+- name: Installing HPE Ezmeral Data Fabric
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+    maprConf: "{{ mapr_home }}/conf"
+    dareKeyFile: "{{ mapr_home }}/conf/dare.master.key"
+    diskEncryption: "{% if enable_encryption_at_rest|default(False) %}1{% else %}0{% endif %}"
+    maprClusterConf: "{{ maprConf }}/mapr-clusters.conf"
+    maprClusterConfRecovery: "{{ maprConf }}/mapr-clusters.conf.recovery"
+    maprSslTrustStore: "{{ maprConf }}/ssl_truststore"
+    maprSslTrustStoreP12: "{{ maprConf }}/ssl_truststore.p12"
+    maprSslTrustStoreBCFKS: "{{ maprConf }}/ssl_truststore.bcfks"
+    maprSslTrustStorePem: "{{ maprConf }}/ssl_truststore.pem"
+    maprSslKeyStore: "{{ maprConf }}/ssl_keystore"
+    maprSslKeyStoreP12: "{{ maprConf }}/ssl_keystore.p12"
+    maprSslKeyStoreBCFKS: "{{ maprConf }}/ssl_keystore.pem"
+    maprSslKeyStorePem: "{{ maprConf }}/ssl_keystore.pem"
+    maprSslKeyDomain: "*.{{ ansible_domain }}"
+    isAlreadySecured: False
+    isAlreadyUnsecured: False
+    security: "{{ mapr.node.security|default('disabled') }}"
+    esSecurity: "{{ mapr.node.es_security|default('disabled') }}"
+
+  pre_tasks:
+  - name: Adding installation lock file
+    file:
+      path: "{{ mapr_home }}/installer-lock.file"
+      state: touch
+
+  - stat: path="{{ maprClusterConf }}"
+    register: mapr_clusters_conf
+
+  - stat: path="{{ maprClusterConfRecovery }}"
+    register: mapr_clusters_conf_recovery
+
+  - debug: var="{{ mapr_clusters_conf_recovery }}"
+
+    # we are retrying - restore original
+  - shell: "cp {{ maprClusterConfRecovery }} {{ maprClusterConf }}"
+    when: mapr_clusters_conf_recovery.stat.exists|bool == True
+
+  - shell: "head -1 {{ maprClusterConf }} | grep -o 'secure=\\w*' | cut -d= -f2"
+    ignore_errors: True
+    register: secure_status
+    when: mapr_clusters_conf.stat.exists|bool == True
+
+  - set_fact: isAlreadySecured=True
+    when: mapr_clusters_conf.stat.exists|bool == True and 'true' in secure_status.stdout
+
+  - set_fact: isAlreadyUnsecured=True
+    when: mapr_clusters_conf.stat.exists|bool == True and 'false' in secure_status.stdout
+
+  - set_fact: changingToSecure="{{ True if (isAlreadyUnsecured and 'disabled' not in security) else False }}"
+
+  - set_fact: changingToUnSecure="{{ True if (isAlreadySecured and security == 'disabled') else False }}"
+
+  - set_fact: changingSecuritySetting="{{ True if (changingToSecure or changingToUnSecure) else False }}"
+
+  - stat: path="{{ maprSslTrustStore }}"
+    register: mapr_ssl_truststore
+
+  - stat: path="{{ maprSslTrustStoreP12 }}"
+    register: mapr_ssl_truststore_p12
+
+  - stat: path="{{ maprSslTrustStoreBCFKS }}"
+    register: mapr_ssl_truststore_bcfks
+
+  - stat: path="{{ maprSslTrustStorePem }}"
+    register: mapr_ssl_truststore_pem
+
+  - stat: path="{{ maprSslKeyStore }}"
+    register: mapr_ssl_keystore
+
+  - stat: path="{{ maprSslKeyStoreP12 }}"
+    register: mapr_ssl_keystore_p12
+
+  - stat: path="{{ maprSslKeyStoreBCFKS }}"
+    register: mapr_ssl_keystore_bcfks
+
+  - stat: path="{{ maprSslKeyStorePem }}"
+    register: mapr_ssl_keystore_pem
+
+  - command: "cp {{ maprSslTrustStore }} {{ maprSslTrustStore }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_truststore.stat.exists|bool == True
+
+  - command: "cp {{ maprSslTrustStoreP12 }} {{ maprSslTrustStoreP12 }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_truststore_p12.stat.exists|bool == True
+
+  - command: "cp {{ maprSslTrustStoreBCFKS }} {{ maprSslTrustStoreBCFKS }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_truststore_bcfks.stat.exists|bool == True
+
+  - command: "cp {{ maprSslTrustStorePem }} {{ maprSslTrustStorePem }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_truststore_pem.stat.exists|bool == True
+
+  - command: "cp {{ maprSslKeyStore }} {{ maprSslKeyStore }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_keystore.stat.exists|bool == True
+
+  - command: "cp {{ maprSslKeyStoreP12 }} {{ maprSslKeyStoreP12 }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_keystore_p12.stat.exists|bool == True
+
+  - command: "cp {{ maprSslKeyStoreBCFKS }} {{ maprSslKeyStoreBCFKS }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_keystore_bcfks.stat.exists|bool == True
+
+  - command: "cp {{ maprSslKeyStorePem }} {{ maprSslKeyStorePem }}.sv.{{ ansible_date_time.epoch }}"
+    when: mapr_ssl_keystore_pem.stat.exists|bool == True
+
+
+  # on retry we need to remove the cldb key and ticket files
+  - block:
+    - file: name="{{ maprConf }}/{{ item }}" state=absent
+      with_items:
+        - mapruserticket
+        - maprserverticket
+        - cldb.key
+
+    - file: name="{{ dareKeyFile }}" state=absent
+      when: diskEncryption|int == 1
+  
+    - stat: path="{{ mapr_home }}/roles/apiserver"
+      register: api_server_role
+
+    # on retry we need to remove the ssl_*store files on nodes that are not running apiserver
+    - file: name="{{ maprConf }}/{{ item }}" state=absent
+      with_items:
+        - ssl_keystore
+        - ssl_keystore.p12
+        - ssl_truststore
+        - ssl_truststore.pem
+      when: api_server_role.stat.exists|bool == False
+    when: changingSecuritySetting
+
+  # for retry we want to make sure services are stopped before we try again
+- import_playbook: upgrade_stop_services.yml dont_check=True
+  when: changingSecuritySetting or (patch_file is defined and patch_file) and not is_fresh_install
+
+# run custom playbook if available and enabled
+- import_playbook: preinstall.yml
+
+- import_playbook: locale.yml
+
+- import_playbook: os_base.yml
+
+- import_playbook: os_security.yml
+
+- import_playbook: openjdk.yml
+  vars:
+    is_upgrade: False
+
+- import_playbook: user_mapr.yml
+  vars:
+    is_upgrade: False
+
+- import_playbook: repos.yml
+
+- import_playbook: install_packages.yml
+  vars:
+    changingSecuritySettingMT: "{{ changingSecuritySetting }}"
+
+- import_playbook: configure_security_controller.yml
+  vars:
+    is_upgrade: False
+  when: (is_fresh_install or mapr.node.installed|bool == False or changingSecuritySetting) and (security == 'master' or security == 'enabled')
+
+- import_playbook: configure.yml
+  vars:
+    changingSecuritySettingMT: "{{ changingSecuritySetting }}"
+    is_upgrade: False
+
+# run custom playbook if available and enabled
+- import_playbook: postcoreconfigure.yml
+
+- import_playbook: disksetup.yml
+  when: inventory_hostname in mapr.groups.cldb
+
+- import_playbook: start_services.yml
+
+- import_playbook: wait_for_cldb.yml
+  when: inventory_hostname not in mapr.groups.cldb
+
+- import_playbook: disksetup.yml
+  when: inventory_hostname not in mapr.groups.cldb
+
+- import_playbook: database_existing.yml
+  when: use_external_mysql
+
+- import_playbook: database_install.yml
+  when: not use_external_mysql
+
+- import_playbook: ecosystem_install.yml
+
+- import_playbook: finalize_cluster.yml
+  vars:
+    changingSecuritySettingMT: "{{ changingSecuritySetting }}"
+
+- import_playbook: ecosystem_configure.yml
+
+- import_playbook: eco_security_controller.yml
+  when: (security == 'master' or security == 'enabled') and
+        (esSecurity == 'master' or esSecurity == 'enabled')
+
+- import_playbook: eco_keys.yml
+  when: (security == 'master' or security == 'enabled') and
+        (esSecurity == 'master' or esSecurity == 'enabled')
+
+- import_playbook: final.yml
+
+# run custom playbook if available and enabled
+- import_playbook: postecoconfigure.yml

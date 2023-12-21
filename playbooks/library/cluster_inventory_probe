@@ -1,0 +1,632 @@
+#!/usr/bin/env python
+
+import xml.etree.ElementTree as Et
+import socket
+import glob
+import sys
+import os
+import platform
+import subprocess
+import tempfile
+import traceback
+import shlex
+import re
+import datetime as dt
+
+from ansible.module_utils import six
+from ansible.module_utils.basic import AnsibleModule
+from ansible.module_utils.mapr_base import MapRBase
+
+
+class ClusterInventoryProbe(MapRBase):
+    BASE_PATH = os.environ['MAPR_HOME'] if 'MAPR_HOME' in os.environ else '/opt/mapr/'
+    BASE_CONF = os.path.join(BASE_PATH, "conf")
+    BASE_SERVER = os.path.join(BASE_PATH, "server")
+
+    def __init__(self, module):
+        self.module = module
+        self.failures = []
+        self.debug = module.params['debug']
+        self.pkg_mgr = PkgMgr(self.debug)
+        self.cluster_admin_id = module.params['cluster_admin_id']
+        self.meta = dict()
+        self.meta['logs'] = str()
+
+    def log_to_meta(self, msg, level="DEBUG",):
+        """
+        Logs appended to meta dictionary into 'logs' field.
+        Then extracted in cluster_probe.py in extract_logs function
+        """
+        self.meta['logs'] += " {0} : {1} {2}\n".format(dt.datetime.now().strftime('%Y-%M-%d %H:%M:%S'), level, msg)
+
+    def get(self):
+        meta = self.meta
+        try:
+            pkgs, pkgs_errout, pkgs_err = self.pkg_mgr.get_pkgs_with_prefix('mapr')
+            if pkgs_err == 0:
+                meta['installer_meta'] = self.get_installer_meta(pkgs)
+            else:
+                meta['pkgs_err'] = pkgs_errout # Todo - sanitize??
+            mep, mep_errout, mep_err = self.pkg_mgr.get_mep_url()
+            if mep_err == 0:
+                meta.update(dict(mep=mep))
+            else:
+                meta.update(dict(mep_err=mep_err)) #Todo - sanitize??
+                self.log_to_meta('mep probe returned error {0} '.format(mep_err))
+            if pkgs.find('mapr-drill-internal') != -1 and \
+                    (pkgs.find('mapr-drill-yarn') == -1 and \
+                    not re.search(r"mapr-drill[\s]+", pkgs)):
+                pkgs = re.sub('mapr-drill-internal[\sa-z:.0-9]*(\\\\n){0,1}','', pkgs) # DAG pulled in drill-internal - remove
+            meta.update(dict(pkgs=pkgs))
+            meta.update(dict(use_dpkg=self.pkg_mgr.use_dpkg))
+            meta.update(dict(es_path=self.get_es_path()))
+            meta.update(dict(db_metas=self.get_db_metas(pkgs)))
+            sp, sp_errout, sp_err = self.get_storagepools()
+            if sp_err == 0:
+                meta.update(dict(storagepools=sp))
+            else:
+                meta.update(dict(storagepools_err=sp_err)) #Todo - sanitize??
+                self.log_to_meta('storagepools probe returned error {0} '.format(sp_err))
+            meta.update(dict(security=self.is_secure()))
+            mapr_subnet = self.get_env_sh_var("MAPR_SUBNET")
+            if mapr_subnet:
+                meta.update(dict(mapr_subnet=mapr_subnet))
+            mapr_external = self.get_env_sh_var("MAPR_EXTERNAL")
+            if mapr_external:
+                meta.update(dict(mapr_external="{0},{1}".format(socket.getfqdn(),mapr_external)))
+            meta.update(self.get_drill_meta(pkgs))
+            ansible_facts = dict(ci_disks=self.get_inst_disks(),
+                                 ci_core_ver=self.get_core())
+            if self.failures:
+                self.module.fail_json(msg=", ".join(self.failures)+", meta={0}".format(meta), meta=meta)
+            else:
+                self.module.exit_json(changed=False, meta=meta,
+                                      ansible_facts=ansible_facts)
+        except ProberException as exc:
+            self.module.fail_json(meta=meta, msg='prober_exception',
+                                  error=str(exc))
+        except Exception as exc:
+            msg = ("Module failed unexpectedly on line {0} due to exception"
+                   "{1}, strack trace {2}\nmeta: {3}").format(sys.exc_info()[-1].tb_lineno, exc, traceback.format_exc(), meta)
+
+            self.module.fail_json(msg=msg, meta=meta)
+
+    def get_db_metas(self, pkgs):
+        db_metas = dict()
+        for svc in BaseDBProbe.get_db_probers().keys():
+            if "{0} version:".format(svc) not in pkgs:
+                continue
+            db_prober = BaseDBProbe.factory(svc, pkgs)
+            db_metas.update(db_prober.get())
+            self.log_to_meta('db_metas {0}'.format({svc: db_prober.debug},))
+        return db_metas
+
+    def get_core(self):
+        ver_elements  = self.get_pkg_ver('mapr-core').split('.')
+        if len(ver_elements) < 3:
+            self.log_to_meta('get_core  found less than 3 digits in mapr-core pkg version({0})'.format(ver_elements))
+            raise ProberException("mapr-core pkg has less than 3 digigt version({0})".format(ver_elements))
+        ver = '.'
+        ver = ver.join(ver_elements[0:3])
+        return ver
+
+    def get_pkg_ver(self, pkg):
+        try:
+            gpkg, gpkg_err, err = self.pkg_mgr.get_single_pkg(pkg)
+            if err == 0:
+                ver = '.'.join(gpkg.split('version:')[1].split('.')[:-2])
+            else:
+                self.log_to_meta('pkg_err {0} not found'.format(pkg))
+                raise ProberException("mapr-core not installed - pkg {0} not found".format(pkg))
+        except IndexError:
+            raise ProberException("mapr-core not installed - failed to parse version for pkg {0}".format(pkg))
+        return ver
+
+    @staticmethod
+    def check_cmd(cmd):
+        if cmd.find("/") != -1:
+            cmd_exists = os.access(cmd, os.X_OK)
+        else:
+            cmd_exists_func = lambda x: any(os.access(os.path.join(path, x),
+                                                      os.X_OK) for path in os.environ["PATH"].split(os.pathsep))
+            cmd_exists = cmd_exists_func(cmd)
+        if not cmd_exists:
+            raise ProberException("{0} not found".format(cmd))
+
+    def get_license(self):
+        ClusterInventoryProbe.check_cmd('maprcli')
+        return self.pkg_mgr.query_piper(["maprcli license list", "grep licType"])
+
+    def get_clusterid(self):
+        path = os.path.join(ClusterInventoryProbe.BASE_PATH, "conf/clusterid")
+        return self.read_firstline(path)
+
+    def get_clustername(self):
+        path = os.path.join(ClusterInventoryProbe.BASE_PATH,
+                            "conf/mapr-clusters.conf")
+        text = self.read_firstline(path)
+        return text.split(" ")[0]
+
+    def is_secure(self):
+        path = os.path.join(ClusterInventoryProbe.BASE_PATH,
+                            "conf/mapr-clusters.conf")
+        return self.read_firstline(path).find("secure=true") != -1
+
+    def read_firstline(self, path):
+        line = ""
+        if os.path.isfile(path) and os.access(path, os.R_OK):
+            with open(path) as file_d:
+                line = file_d.readline().strip()
+        else:
+            self.failures.append("Cannot read from {0}".format(path))
+        return line
+
+    def read_lines(self, path):
+        lines = []
+        if os.path.isfile(path) and os.access(path, os.R_OK):
+            with open(path) as file_d:
+                lines = map(str.strip, file_d.readlines())
+        else:
+            self.failures.append("Cannot read from {0}".format(path))
+        return lines
+
+    def get_env_sh_var(self, var_name):
+        paths = [ os.path.join(ClusterInventoryProbe.BASE_PATH,
+                            "conf/env_override.sh"),
+                  os.path.join(ClusterInventoryProbe.BASE_PATH,
+                            "conf/env.sh") ]
+        env_var_strings = []
+        for p in paths:
+            if os.path.isfile(p) and os.access(p, os.R_OK):
+                env_var, env_err, err = self.pkg_mgr.query_piper(["grep '^[ \t]*export[ \t][ \t]*{0}=' {1}".format(var_name, p)])
+                if (self.debug):
+                    self.log_to_meta('get_env_sh_var: grep for {0} returned: {1}, stderr {2}, errcode {3}'
+                                     .format(var_name, env_var, env_err, err))
+
+                if env_var and len(env_var) > 0 and err == 0:
+                    env_var_parts=env_var.split('=')
+                    if len(env_var_parts) > 1:
+                        env_var_strings.append(env_var_parts[1])
+        if len(env_var_strings) > 1:
+            # TODO: We need to add a logger to this module
+            if (self.debug):
+                self.log_to_meta('get_env_sh_var: Found multiple MAPR_SUBNET set, picking the one in the ovrride file')
+        if len(env_var_strings) >= 1:
+            return env_var_strings[-1]
+        return ""
+
+    def get_installer_meta(self, pkgs):
+        meta = dict()
+        meta['cluster_id'] = self.get_clusterid()
+        meta['cluster_name'] = self.get_clustername()
+        license, license_err, license_errcode = self.get_license()
+        if self.debug:
+            self.log_to_meta('get_installer_meta:DEBUGLICENSE')
+        if license_errcode == 0:
+            meta['license'] = license
+        else:
+            self.failures.append("Cannot get license: stdout {0}, stderr {1}, errcode {2}".format(license, license_err, license_errcode))
+        return meta
+
+    def get_inst_disks(self):
+        path = os.path.join(ClusterInventoryProbe.BASE_PATH, "conf/disktab")
+        lines = self.read_lines(path)
+        disks = []
+        for line in lines:
+            if not line or line[0] != "/":
+                continue
+            disks.append(line.split(" ")[0])
+        return sorted(disks)
+
+    def get_storagepools(self):
+        cmd_path = os.path.join(ClusterInventoryProbe.BASE_SERVER, 'mrconfig')
+        ClusterInventoryProbe.check_cmd(cmd_path)
+        return self.pkg_mgr.query_piper(["{0} sp list -v".format(cmd_path)])
+
+    def get_es_path(self):
+        path = ""
+        files = ' '.join(glob.glob("/opt/mapr/elasticsearch/elasticsearch*/etc/"
+                                   "elasticsearch/elasticsearch.yml"))
+        if len(files):
+            try:
+                path_str, path_err, err = self.pkg_mgr.query_piper(['grep "path\.data" {0}'.
+                                                              format(files)])
+                if self.debug and err != 0:
+                    self.log_to_meta('get_es_path: path_str: {0}, path_err: {1}, err: {2}'.
+                          format(path_str, path_err, err))
+                if err == 0:
+                    if path_str[0] == "#":
+                        path = ""
+                    else:
+                        path = path_str.split('path.data:')[1]
+            except IndexError:
+                pass
+        return path
+
+    def get_drill_meta(self, pkgs):
+        if pkgs.find('mapr-drill') == -1:  # if no mapr-drill and mapr-drill-yarn in pkgs.
+            return {}  # Empty dict.
+        elif 'mapr-drill-yarn' in pkgs and 'mapr-drill ' in pkgs:  # 'mapr-drill ' with space.
+            return dict(drill_on_yarn=True, drill_bits=True,
+                        msg=("Found unsupported configuration. "
+                             "Drill will not work likely."))
+        elif 'mapr-drill-yarn' in pkgs:
+            return dict(drill_on_yarn=True)
+        size = -1
+        percent = -1
+        has_gateway = False
+        has_qs_gateway = False
+        proc_mem_percent = False
+        proc_mem_val = -1
+        qs_in_default = False
+        path = os.path.join(ClusterInventoryProbe.BASE_PATH,
+                            "conf/conf.d/warden.drill-bits.conf")
+        try:
+            lines = self.read_lines(path)
+            is_default_line = lambda line: line.strip().startswith("#Default")
+            is_service_env_line = lambda line: line.strip().startswith("service.env=")
+            is_heappercent_line = lambda line: line.strip().startswith("service.heapsize.percent=")
+            is_heapsize_line = lambda line: line.strip().startswith("service.heapsize.min=")
+            default_line = filter(is_default_line, lines)
+            heap_line = filter(is_heapsize_line, lines)
+            service_line = filter(is_service_env_line, lines)
+            percent_line = filter(is_heappercent_line, lines)
+            size = int(heap_line[-1].split("=")[-1])
+            percent = int(percent_line[-1].split("=")[-1])
+            service = service_line[-1].split('=')
+            proc_mem_idx = service.index('DRILLBIT_MAX_PROC_MEM')
+            proc_mem_val = service[proc_mem_idx + 1]
+            if '%' in proc_mem_val:
+                proc_mem_percent = True
+                proc_mem_val = proc_mem_val.strip('%')
+            if 'm' in proc_mem_val:
+                proc_mem_val = proc_mem_val.strip('m')
+            if 'QS' in default_line:
+                qs_in_default = True
+            cmd = "sudo -E -n -u %s maprcli cluster gateway list -json" % (self.cluster_admin_id,)
+            env = dict(MAPR_TICKETFILE_LOCATION="/opt/mapr/conf/mapruserticket")
+            _, code, _ = self.log_run_cmd(cmd=cmd, env_dict=env)
+            has_gateway = code == 0
+            cmd = "sudo -E -n -u %s maprcli cluster queryservice getconfig | grep drillbits | awk '{print $5}' | grep -i true" % (self.cluster_admin_id,)
+            _, code, _ = self.log_run_cmd(cmd=cmd, env_dict=env, shell=True)
+            has_qs_gateway = code == 0
+        except Exception:
+            pass
+        return dict(drill_heapsize=size, drill_heappercent=percent, proc_mem_percent=proc_mem_percent, \
+                    proc_mem_value=proc_mem_val, qs_in_default=qs_in_default, has_gateway=has_gateway, \
+                    has_qs_gateway=has_qs_gateway)
+
+
+class PkgMgr(object):
+    def __init__(self, debug=False):
+        self.use_dpkg = platform.linux_distribution()[0].lower(). \
+                            find("ubuntu") != -1
+        self.debug = debug
+
+    def get_single_pkg(self, name):
+        return self.get_matching_pkgs("{0} ".format(name))
+
+    def get_pkgs_with_prefix(self, prefix):
+        return self.get_matching_pkgs("{0}.*".format(prefix))
+
+    def get_matching_pkgs(self, wildcard):
+        if self.use_dpkg:
+            pkg_qry = 'dpkg-query -W -f="${Package} version:${Version} ' \
+                      'status:${Status}\n"'
+            pkgs, pkgs_err, err = self.query_piper([pkg_qry,
+                                       'grep "{0}version.*installed"'.format(wildcard)])
+        else:
+            pkg_qry = 'rpm -qa --queryformat "%{NAME} version:%{VERSION}\n"'
+            pkgs, pkgs_err, err = self.query_piper([pkg_qry, "grep {0}".format(wildcard)])
+        return pkgs, pkgs_err, err
+
+    def get_mep_url(self):
+        repo_dir = ""
+        if self.use_dpkg:
+            repo_dir = "/etc/apt/sources.list.d/"
+        else:
+            yum_dir = "/etc/yum.repos.d/"
+            zypper_dir = "/etc/zypp/repos.d/"
+            if os.path.isdir(yum_dir):
+                repo_dir = yum_dir
+            elif os.path.isdir(zypper_dir):
+                repo_dir = zypper_dir
+        return self.query_piper(["grep -r MEP\/MEP- {0}".format(repo_dir)]) \
+            if repo_dir else ""
+
+    def query_piper(self, qry_list):
+        res_out = None
+        res_err = None
+        res_out_file = None
+        for qry in qry_list:
+            res = subprocess.Popen(shlex.split(qry), stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, stdin=res_out_file)
+            res_out, res_err = res.communicate()
+            err_code = res.returncode
+            if res_out is not None:
+                res_out = res_out.decode("utf-8")
+                res_out = res_out.strip()
+            if res_err is not None:
+                res_err = res_err.decode("utf-8")
+                res_err = res_err.strip()
+            if self.debug:
+                with open('/tmp/query_piper_cmds.txt',"a+") as file:
+                    file.write('qry = {0}, res_out = {1}, res_err = {2}, err_code = {3}'\
+                               .format(qry, res_out, res_err, err_code))
+            if err_code != 0:
+                return res_out, res_err, err_code
+                break
+            if res_out_file is not None and not self.debug:
+                res_out_file.delete()
+            if len(qry_list) > 1:
+                if six.PY3:
+                    res_out_file = tempfile.NamedTemporaryFile(mode="w", encoding='utf-8')
+                else:
+                    res_out_file = tempfile.NamedTemporaryFile(mode="w")
+                res_out_file.write(res_out)
+                res_out_file.seek(0)
+        return res_out, res_err, err_code
+
+
+class BaseDBProbe(object):
+    def __init__(self, name, search_str, svc):
+        self.name = name
+        self.pkg_base = ClusterInventoryProbe.BASE_PATH if name == "metrics" \
+            else self.get_db_base(self.find_ver(search_str))
+        self.svc = svc
+        self.db_meta = dict()
+        self.debug = dict()
+
+    @staticmethod
+    def factory(svc, pkgs):
+        return BaseDBProbe.get_db_probers()[svc](svc, pkgs)
+
+    @staticmethod
+    def get_db_probers():
+        return {
+            'mapr-oozie': OozieXMLProbe,
+            'mapr-hivemetastore': HiveXMLProbe,
+            'mapr-sentry-server': SentryXMLProbe,
+            'mapr-hue': HueINIProbe,
+            'mapr-metrics': MetricsINIProbe
+        }
+
+    def get_db_base(self, ver):
+        return os.path.join(ClusterInventoryProbe.BASE_PATH, "{0}/{1}-{2}".
+                            format(self.name, self.name, ver))
+
+    def get(self):
+        is_embedded = self.is_embedded()
+        if is_embedded:
+            self.get_embedded()
+        else:
+            self.get_mysql()
+            self.mark_create()
+        self.debug['is_embedded'] = is_embedded
+        return {self.svc: self.db_meta}
+
+    def mark_create(self):
+        my_hosts = []
+        my_hosts.append(socket.getfqdn())
+        for _,_,_,_,ip_tup in socket.getaddrinfo(my_hosts[0],80,socket.AF_INET):
+            my_hosts.append(ip_tup[0])
+
+        self.db_meta['create'] = self.db_meta['host'] in my_hosts
+        if self.db_meta['create']:
+            self.db_meta.pop('host')
+        else:
+            self.db_meta['label'] = 'Use existing MySQL server'
+
+    def is_embedded(self):
+        return False
+
+    def get_embedded(self):
+        self.db_meta = dict(type='DEFAULT', create=False)
+
+    def get_mysql(self):
+        self.db_meta = dict(type='MYSQL')
+
+    def find_ver(self, search_str):
+        dots = search_str.split("{0} version:".format(self.name))[1].split(".")
+        ver = '.'.join(dots[:3])
+        if os.path.isdir(self.get_db_base(ver)):
+            return ver
+        wrong_vers = [ver]
+        ver = '.'.join(dots[:2])
+        if os.path.isdir(self.get_db_base(ver)):
+            return ver
+        wrong_vers.append(ver)
+        raise ProberException("Unable to find DB metadata for service {0} Found"
+                              " versions {1}".format(self.name, wrong_vers))
+
+    @staticmethod
+    def parse_jdbc(jdbc_url):
+        host_port, schema = re.split('jdbc.*\/\/', jdbc_url)[1].split('?')[0]. \
+            split('/')
+        host = host_port.split(':')[0]
+        return dict(host=host, name=schema)
+
+
+class XMLDBProbe(BaseDBProbe):
+    def __init__(self, name, search_str, keys, svc):
+        super(XMLDBProbe, self).__init__(name, search_str, svc)
+        self.keys = keys
+        self.cfg_node = self.get_cfg_node()
+
+    def get_cfg_node(self):
+        file_name = self.get_path()
+        try:
+            root = Et.parse(file_name).getroot()
+        except IOError:
+            raise ProberException("{0} file not found or unreadable".
+                                  format(file_name))
+        except Et.ParseError:
+            raise ProberException("{0} is not a valid XML file".
+                                  format(file_name))
+        return root.find('configuration') if root.tag != 'configuration' \
+            else root
+
+    def get_path(self):
+        return os.path.join(self.pkg_base, "conf/{0}-site.xml".
+                            format(self.name))
+
+    def get_mysql(self):
+        super(XMLDBProbe, self).get_mysql()
+        for prop in self.cfg_node.findall('property'):
+            prop_name = prop.find('name').text.strip()
+            if prop_name not in self.keys:
+                continue
+            val = prop.find('value').text.strip()
+            if self.keys[prop_name] == 'url':
+                self.db_meta.update(BaseDBProbe.parse_jdbc(val))
+            else:
+                self.db_meta[self.keys[prop_name]] = val
+
+    def is_embedded(self):
+        found_props = set([])
+        for prop in self.cfg_node.findall('property'):
+            prop_name = prop.find('name').text.strip()
+            if prop_name not in self.keys:
+                continue
+            found_props.add(prop_name)
+        self.debug['found_props'] = found_props
+        return found_props != set(self.keys.keys())
+
+
+class HiveXMLProbe(XMLDBProbe):
+    def __init__(self, svc, search_str):
+        keys = {
+            'javax.jdo.option.ConnectionURL': 'url',
+            'javax.jdo.option.ConnectionUserName': 'user'}
+        super(HiveXMLProbe, self).__init__('hive',
+                                           search_str, keys, svc)
+
+
+class OozieXMLProbe(XMLDBProbe):
+    def __init__(self, svc, search_str):
+        keys = {
+            'oozie.service.JPAService.jdbc.url': 'url',
+            'oozie.service.JPAService.jdbc.username': 'user',
+            'oozie.service.JPAService.jdbc.password': 'password'}
+        super(OozieXMLProbe, self).__init__('oozie',
+                                            search_str, keys, svc)
+
+
+class SentryXMLProbe(XMLDBProbe):
+    def __init__(self, svc, search_str):
+        keys = {
+            'sentry.store.jdbc.url': 'url',
+            'sentry.store.jdbc.user': 'user',
+            'sentry.store.jdbc.password': 'password'}
+        super(SentryXMLProbe, self).__init__('sentry',
+                                             search_str, keys, svc)
+
+    def get_path(self):
+        return os.path.join(self.pkg_base, "conf/{0}-site.xml".
+                            format(self.name))
+
+
+class HueINIProbe(BaseDBProbe):
+    def __init__(self, svc, search_str):
+        super(HueINIProbe, self).__init__('hue', search_str, svc)
+
+    def get_cfg_node(self):
+        path = os.path.join(self.pkg_base, "desktop/conf/{0}.ini".
+                            format(self.name))
+        return IniParser(path).get_dict('desktop.database')
+
+    def is_embedded(self):
+        return 'engine' not in self.get_cfg_node() or \
+               self.get_cfg_node()['engine'] == 'sqlite3'
+
+    def get_mysql(self):
+        super(HueINIProbe, self).get_mysql()
+        cfg = self.get_cfg_node()
+        self.db_meta.update(dict(name=cfg.get('name', ''),
+                                 user=cfg.get('user', ''),
+                                 password=cfg.get('password', ''),
+                                 host=cfg.get('host', '')
+                                 )
+                            )
+
+
+class MetricsINIProbe(BaseDBProbe):
+    def __init__(self, svc, search_str):
+        super(MetricsINIProbe, self).__init__('metrics', search_str, svc)
+
+    def get_cfg_node(self):
+        path = os.path.join(ClusterInventoryProbe.BASE_PATH, "conf/db.conf")
+        return IniParser(path).get_dict()
+
+    def get_mysql(self):
+        super(MetricsINIProbe, self).get_mysql()
+        cfg = self.get_cfg_node()
+        host = cfg.get('db.url', '').split(':')[0]
+        self.db_meta.update(dict(name=cfg.get('db.schema', ''),
+                                 user=cfg.get('db.user', ''),
+                                 password=cfg.get('db.passwd', ''),
+                                 host=host))
+
+
+class IniParser(object):
+    def __init__(self, path):
+        if not os.path.isfile(path):
+            raise ProberException("{0} must be of type file".format(path))
+        if not os.access(path, os.R_OK):
+            raise ProberException("{0} must be readable".format(path))
+        with open(path) as fp:
+            self.path = path
+            self.lines = filter(lambda line: len(line.strip()) > 0 and
+                                             line.strip()[0] != '#', fp.readlines())
+
+    def get_dict(self, dotprop=''):
+        if dotprop:
+            start = self.get_start(dotprop)
+        else:
+            start = 0
+        end = self.get_end(start)
+        res = dict()
+        for idx in range(start, end):
+            split_str = self.lines[idx].split("=")
+            key = split_str[0].strip()
+            val = "=".join(split_str[1:]).strip()
+            res[key] = val
+        return res
+
+    def get_start(self, dotprop):
+        props = dotprop.split(".")
+        props_idx = 0
+        start = -1
+        for idx, line in enumerate(self.lines):
+            if props_idx == len(props):
+                start = idx
+                break
+            brack_len = props_idx + 1
+            section = '[' * brack_len + props[props_idx] + ']' * brack_len
+            if line.find(section) != -1:
+                props_idx += 1
+                continue
+        if start == -1:
+            raise ProberException('Property {0} not found in config file {1}'.
+                                  format(dotprop, self.path))
+        return start
+
+    # In py2 variable 'start' is a list, in py3 is an iterator
+    def get_end(self, start):
+        self.lines = list(self.lines)
+        if re.search('\[.*\]', self.lines[start]):
+            end = start
+        else:
+            end = start + 1
+            while end < len(self.lines):
+                if re.search('\[.*\]', self.lines[end]):
+                    break
+                end += 1
+        return end
+
+
+class ProberException(Exception):
+    pass
+
+
+ClusterInventoryProbe(AnsibleModule(argument_spec=dict(cluster_admin_id=dict(required=True), debug=dict(required=False)))).get()

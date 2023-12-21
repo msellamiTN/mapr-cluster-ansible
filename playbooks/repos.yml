@@ -1,0 +1,35 @@
+---
+#
+# Playbook Name:: repos
+#
+# Copyright 2013, MapR Technologies
+#
+# This playbook initializes the repository specifications for # MapR software
+# It MUST be run before attempting to install packages
+#
+
+- name: Configuring package repository
+  hosts: all
+  serial: "{{ forks }}"
+
+  tasks:
+  - name: Group by OS family
+    group_by: key={{ ansible_os_family }}
+
+  - name: Shift to https for package.ezmeral.hpe.com
+    set_fact:
+      repo_core_url: "{{ repo_core_url | regex_replace('^http://', 'https://') }}"
+      repo_eco_url: "{{ repo_eco_url | regex_replace('^http://', 'https://') }}"
+    when: '"package.ezmeral.hpe.com" in repo_core_url'
+
+  - debug: msg="MAPR_VERSION={{ version }} MAPR_CORE_REPO_URL={{ repo_core_url }}
+        MAPR_ECO_REPO_URL={{ repo_eco_url }}"
+
+  - copy: src="/opt/mapr/installer/etc/gnugpg.key" dest="/tmp/gnugpg.key"
+
+  - copy: src="/opt/mapr/installer/etc/maprgpg.key" dest="/tmp/maprgpg.key"
+
+# must be at the same indentation level as the above "- name:" directive
+- import_playbook: repos_apt.yml
+- import_playbook: repos_yum.yml
+- import_playbook: repos_zypper.yml

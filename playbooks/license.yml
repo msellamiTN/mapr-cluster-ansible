@@ -1,0 +1,49 @@
+---
+#
+# Playbook Name:: license
+#
+# Copyright 2017, MapR Technologies
+#
+
+- name: Adding a license
+  hosts: all
+  gather_facts: no
+  vars:
+    security: "{{ mapr.node.security|default('disabled') }}"
+    ticket_file: "{{mapr_home}}/conf/mapruserticket"
+    nfs_service: "{% if data.nfs_type|default('NFSv3') == 'NFSv3' %}nfs{% else %}nfs4{% endif %}"
+    installer_tmp_dir: "/tmp/installer"
+    tmp_installer_license: "{{ installer_tmp_dir }}/license.txt"
+
+  environment:
+      MAPR_TICKETFILE_LOCATION: "{{ ticket_file }}"
+
+  tasks:
+    - file:
+        path: "{{ installer_tmp_dir }}"
+
+    - copy:
+        src: "{{ license_tmp_file }}"
+        dest: "{{ tmp_installer_license }}"
+      register: copied_file
+      run_once: True
+
+    - block:
+      - name: "Adding a license from maprcli"
+        shell: "maprcli license add -is_file true -license {{ tmp_installer_license }}"
+        run_once: True
+
+      - file:
+          path: "{{ tmp_installer_license }}"
+          state: absent
+
+      - name: "Bounce NFS server so it sees the new license - since warden might wait 30min"
+        shell: "maprcli node services -name {{ nfs_service }}  -action restart -nodes {{ groups.all|join(',') }}"
+        run_once: True
+        ignore_errors: True
+        register: bounce_nfs
+
+      - debug: msg="Failed to bounce NFS servers for all nodes - it might take a while before NFS service is available"
+        when: bounce_nfs is failed
+
+      when: copied_file

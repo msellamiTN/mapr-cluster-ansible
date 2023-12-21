@@ -1,0 +1,28 @@
+---
+#
+# Playbook Name:: postinstal.yml
+#
+# Copyright 2019, MapR Technologies
+#
+
+- name: Custom Post Install Configure playbook hook
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+      cpbs_disable: "{{ custom_pbs_disable|default(false) }}"
+
+  tasks:
+     - local_action: stat path="{{ maprCustomDir }}/postinstall"
+       become: false
+       register: postinstalldir
+
+     - include_role:
+          name: postinstall
+       when: postinstalldir.stat.exists and not cpbs_disable
+
+     - file: path=/tmp/installer/services state=absent
+
+     - file: path=/opt/mapr/conf/mapr-clusters.conf.recovery state=absent
+
+     - mapr_complete.py: command="{{ command }}"

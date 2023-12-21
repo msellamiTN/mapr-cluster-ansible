@@ -1,0 +1,151 @@
+---
+#
+# Playbook Name:: disksetup
+#
+# Copyright 2013, MapR Technologies
+#
+#   Very simple implementation. Calls MapR disksetup utility
+#   with disks specified in mapr.node.disks property (typically passed
+#   in with the extra-vars YAML file). There is SOME logic to
+#   auto-discover drives, but don't count on it unless you have to.
+#
+#   Doing this in "ansible logic" is a bit of a pain, but
+#   we manage.
+#
+# TO BE DONE
+#   1. Handle the case where disksetup fails after creating a disks.txt
+#      file from the local input; we should delete disks.txt in that case
+#   2. Use the list of packages to determine whether we need to do
+#      any of this.  Basically, we should gate on the "fileserver"
+#      package, but I cannot figure out the proper ansible syntax to do that.
+#
+
+- name: Configuring disks for MapR-FS
+  hosts: all
+  serial: "{{ forks }}"
+  gather_facts: False
+
+  vars:
+    diskfile: "{{ mapr_home }}/conf/disks.txt"
+    disktab: "{{ mapr_home }}/conf/disktab"
+    disks_to_use: "{{ mapr.node.disks }}"
+    pkgs: "{{ mapr.node.packages|join(',') }}"
+    diskstripe: "{{ mapr_diskstripe|default('') }}"
+    enable_ssd: True
+    enable_trim: True
+    mfsConfFile: "{{ mapr_home }}/conf/mfs.conf"
+
+  tasks:
+
+  - debug: msg="{{ mapr }}"
+
+  - set_fact: enable_sdd=False
+    when: item.value.rotational|int == 1
+    with_dict: "{{ mapr.node.disks }}"
+  - debug: msg="{{ enable_ssd }}"
+
+  - set_fact: enable_trim=False
+    when: item.value.supportDiscard|int == 0
+    with_dict: "{{ mapr.node.disks }}"
+
+  - debug: msg="enable_trim {{ enable_trim }}"
+
+  - ansible.builtin.lineinfile: path="{{ mfsConfFile }}" backrefs=yes regexp="(^[ \t]*#[ \t]*)(mfs.ssd.trim.enabled=1)" line="mfs.ssd.trim.enabled=1"
+    when: enable_trim and enable_ssd
+
+  - ansible.builtin.lineinfile: path="{{ mfsConfFile }}" backrefs=yes regexp="^(mfs.ssd.trim.enabled=1)" line="#\1"
+    when: not enable_trim
+
+  - ansible.builtin.lineinfile: path="{{ mfsConfFile }}" backrefs=yes regexp="(^[ \t]*#[ \t]*)(mfs.disk.is.ssd=1)" line="\2" state=present
+    when: enable_ssd
+
+  - ansible.builtin.lineinfile: path="{{ mfsConfFile }}" backrefs=yes regexp="^(mfs.disk.is.ssd=1)" line="#\1" state=present
+    when: not enable_ssd
+    ignore_errors: true
+
+  - stat: path="{{ diskfile }}"
+    register: diskfile_stat
+    check_mode: False
+
+  # TBD : generate the $diskfile here with auto disk detection
+  - action: "find_disks.sh  DISKFILE={{ diskfile }}"
+    when: diskfile_stat.stat.exists|bool == False  and  item|string == "auto"
+    with_items: "{{ mapr.node.disks|join(',') }}"
+
+  # Recheck $diskfile; it may have been created by "auto" above
+  - stat: path="{{ diskfile }}"
+    register: diskfile_stat
+    check_mode: False
+
+  # If disks are specified, just generate disks.txt
+  - ansible.builtin.lineinfile: dest="{{ diskfile }}" create=yes mode=0644 regexp="{{ item }}"
+        line="{{ item }}"
+    with_items: "{{ mapr.node.disks }}"
+    when: diskfile_stat.stat.exists|bool == False and
+          mapr.node.disks|join(',')|string != "auto" and
+          mapr.node.installed|bool == False
+
+  # Recheck $diskfile; it may have been created above
+  - stat: path="{{ diskfile }}"
+    register: diskfile_stat
+    check_mode: False
+
+  - stat: path="{{ disktab }}"
+    register: disktab_stat
+    check_mode: False
+
+  - command: "sed -i -e 's/mapr/#mapr/g' /etc/security/limits.conf"
+    when: docker|bool == True
+
+  - command: "sed -i -e 's/AddUdevRules(list(gdevices));/#AddUdevRules(list(gdevices));/g' {{ mapr_home }}/server/disksetup"
+    when: docker|bool == True
+
+  - name: "Ensure that hostname file contain only valid hostname"
+    ansible.builtin.lineinfile:
+      path: "{{ mapr_home }}/hostname"
+      state: present
+      line: '{{ ansible_hostname }}'
+
+  - name: "Check if there are content in hostid file"
+    command: "cat {{ mapr_home }}/hostid"
+    register: cat_hostid
+    ignore_errors: yes
+
+  # If cat will return stderr (file not found) or file will contain only newline character.
+  - name: "Generate hostid"
+    command: "{{ mapr_home }}/server/mruuidgen > {{ mapr_home }}/hostid"
+    when: cat_hostid.stderr or cat_hostid.stdout == "\n"
+
+  - name: "Output hostid file if cat returned error or it contain only newline character"
+    debug:
+      msg: "cat_hostid: {{ cat_hostid.stdout }} {{ cat_hostid.stdout_lines }}"
+    when: cat_hostid.stderr
+
+
+  # Call the library/do_disksetup.sh wrapper script
+#  - command: "{{ mapr_home }}/server/disksetup -F {{ diskfile }}"
+  - name: Call do_disksetup.sh with predefined configuration from 'disksetup.yml'
+    action: "do_disksetup.sh MAPR_HOME={{ mapr_home }} DISKFILE={{ diskfile }}
+        STRIPE_WIDTH={{ mapr.node.disk_stripe }}
+        FORCE_FORMAT={{ mapr.node.disk_format }}"
+    register: disksetup_return
+    when: diskfile_stat.stat.exists|bool == True and
+        disktab_stat.stat.exists|bool == False and mapr.node.installed|bool == False
+    ignore_errors: True
+
+  # log what disksetup returned if we fail
+  - debug: var=disksetup_return
+    when: disksetup_return is failed
+
+  # If disksetup fails, always remove the disks.txt file
+  # to that subsequent executions of the playbook will
+  # have a chance at running properly.
+  - name: Removing diskfile because do_disksetup.sh failed
+    action: "shell rm -f {{ diskfile }}"
+    when: mapr.node.installed|bool == False and disksetup_return is failed
+  - fail: msg="Failed to format {{ mapr.node.disks|join(',') }} for MapR-FS.
+        Review {{ mapr_home }}/logs/disksetup.0.log, address the reported
+        issues and retry installation"
+    when: mapr.node.installed|bool == False and disksetup_return is failed
+
+  - mapr_state.py: state=13

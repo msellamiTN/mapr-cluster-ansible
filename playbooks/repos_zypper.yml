@@ -1,0 +1,93 @@
+---
+#
+# Playbook Name:: repos_zypper
+#
+# Copyright 2013, MapR Technologies
+#
+# This playbook initializes repo settings for MapR software on SUSE nodes
+#
+
+- name: Configuring package repository for SUSE based OS
+  hosts: Suse
+  serial: "{{ forks }}"
+  gather_facts: False
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    repo_subdir: ""
+    do_protected_repo: False
+
+  tasks:
+  - set_fact: repo_subdir=/suse
+    when: not repo_full_url
+
+  - file: path=/etc/zypp/repos.d state=directory mode=0755
+
+  - rpm_key: key="/tmp/gnugpg.key"
+
+  - rpm_key: key="/tmp/maprgpg.key"
+
+  - set_fact:
+      do_protected_repo: True
+      repo_password_encoded: "{{ repo_password | urlencode }}"
+      repo_user_encoded: "{{ repo_user | urlencode }}"
+      repo_core_url_parts: "{{ repo_core_url | urlsplit }}"
+      repo_core_eco_parts: "{{ repo_eco_url | urlsplit }}"
+    when: repo_user is defined and repo_password is defined and repo_user != "" and repo_password != ""
+
+  - set_fact:
+      repo_core: "{{ repo_core_url_parts.scheme ~ '://' ~ (repo_user_encoded ~ ':' ~ repo_password_encoded) ~ '@' ~ repo_core_url_parts.netloc ~ repo_core_url_parts.path }}"
+      repo_eco: "{{ repo_core_eco_parts.scheme ~ '://' ~ (repo_user_encoded ~ ':' ~ repo_password_encoded) ~ '@' ~ repo_core_eco_parts.netloc ~ repo_core_eco_parts.path }}"
+    when: do_protected_repo
+
+  - set_fact:
+      repo_core: "{{ repo_core_url }}"
+      repo_eco: "{{ repo_eco_url }}"
+    when: not do_protected_repo
+
+  - name: Configuring core repo for SUSE
+    template:
+      src: zypper_mapr_core
+      dest: /etc/zypp/repos.d/mapr_core.repo
+      owner: root
+      group: root
+      mode: '644'
+    ignore_errors: True
+    register: core_result
+
+  # log the failure
+  - debug: var=core_result
+    when: core_result is failed
+
+  - file: path=/etc/zypp/repos.d/mapr_core.repo state=absent
+    when: core_result is failed
+
+  - fail: msg="Unable to configure MapR Core repository. Confirm that repository
+        target {{ repo_core }} is accessible"
+    when: core_result is failed
+
+  - name: Configuring eco repo for SUSE
+    template:
+      src: zypper_mapr_ecosystem
+      dest: /etc/zypp/repos.d/mapr_ecosystem.repo
+      owner: root
+      group: root
+      mode: '644'
+    ignore_errors: True
+    register: eco_result
+
+  # log the failure
+  - debug: var=eco_result
+    when: eco_result is failed
+
+  - file: path=/etc/zypp/repos.d/mapr_ecosystem.repo state=absent
+    when: eco_result is failed
+
+  - fail: msg="Unable to configure MapR Ecosystem repository. Confirm that
+        repository target {{ repo_eco }} is accessible"
+    when: eco_result is failed
+
+  - mapr_state.py: state=7

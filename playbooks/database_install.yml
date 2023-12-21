@@ -1,0 +1,537 @@
+---
+#
+# Playbook Name:: database
+#
+# Copyright 2017, MapR Technologies
+
+- name: Configuring database (Installer-managed SQL Server)
+  hosts: all
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    mysql_hname_lim: 60
+    mysql_lower_case_table_names: 1
+    admin_password: "{{ db_admin_password|default('') }}"
+    ansible_python_interpreter: /usr/bin/python3
+
+  tasks:
+  - name: Define ansible_python_interpreter for SLES only since they default python3 to python3.4
+    set_fact:
+      ansible_python_interpreter: /usr/bin/python2
+    when: ansible_os_family == 'Suse' and ansible_distribution_major_version < '15'
+
+  - name: Collecting packages info
+    package_facts:
+      manager: "auto"
+
+  - name: Checking installed packages
+    set_fact:
+      mariadb_client_already_installed: "{{ True if 'mariadb-client' in ansible_facts.packages else False }}"
+      mysql_client_already_installed: "{{ True if 'mysql-client' in ansible_facts.packages else False }}"
+      mariadb_server_already_installed: "{{ True if 'mariadb-server' in ansible_facts.packages else False }}"
+      mysql_server_already_installed: "{{ True if 'mysql-server' in ansible_facts.packages else False }}"
+    when: ansible_os_family == 'RedHat' or ansible_os_family == 'Debian'
+
+  - set_fact:
+      mariadb_client_already_installed: "{{ True if 'mariadb-client' in ansible_facts.packages else False }}"
+      mysql_client_already_installed: "{{ True if 'mysql-client' in ansible_facts.packages else False }}"
+      mariadb_server_already_installed: "{{ True if 'mariadb' in ansible_facts.packages else False }}"
+      mysql_server_already_installed: "{{ True if 'mysql' in ansible_facts.packages else False }}"
+    when: ansible_os_family == 'Suse'
+
+  - set_fact:
+      mysql_db_already_installed: "{{ True if (mysql_server_already_installed or mariadb_server_already_installed) else False }}"
+
+  - name: Checking for MYSQL presence with yum
+    yum:
+      name: mysql
+      state: present
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    register: yum_installed_mysql
+    until: yum_installed_mysql is succeeded
+    when: ansible_os_family == 'RedHat'
+          and ansible_distribution_major_version < '8'
+
+  - name: Checking for MYSQL presence with apt
+    apt:
+      name: mysql-client
+      state: present
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: apt_installed_mysql_client is succeeded
+    when: ansible_os_family == 'Debian' and ansible_distribution_major_version < '20' and
+          not mysql_client_already_installed and not mariadb_client_already_installed
+    register: apt_installed_mysql_client
+
+  - name: Checking for MYSQL presence with apt
+    apt:
+      name: mariadb-client
+      state: present
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: apt_installed_mariadb_client is succeeded
+    when: ansible_os_family == 'Debian' and ansible_distribution_major_version >= '20' and
+          not mysql_client_already_installed and not mariadb_client_already_installed
+    register: apt_installed_mariadb_client
+
+  - name: Checking for MYSQL presence with zypper < suse15
+    zypper:
+      name: mysql-client
+      state: present
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: zypper_installed_mysql_client is succeeded
+    register: zypper_installed_mysql_client
+    when: ansible_os_family == 'Suse' and ansible_distribution_major_version < '15'
+
+  - name: Checking for MYSQL presence with zypper >= suse15
+    zypper:
+      name: mariadb-client
+      state: present
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: zypper_installed_mariadb_client is succeeded
+    register: zypper_installed_mariadb_client
+    when: ansible_os_family == 'Suse' and ansible_distribution_major_version >= '15'
+
+  - block:
+
+    - name: Installing mysql sql engine for RedHat 6
+      yum:
+        name: mysql-server,MySQL-python
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: yum_installed_mysql_server is succeeded
+      register: yum_installed_mysql_server
+      when: ansible_os_family == 'RedHat' and
+            ansible_distribution_major_version == '6'
+
+    - name: Installing mariadb sql engine for RedHat 7
+      yum:
+        name: mariadb-server,MySQL-python
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: yum_installed_mariadb_server is succeeded
+      register: yum_installed_mariadb_server
+      when: ansible_os_family == 'RedHat' and
+            ansible_distribution_major_version == '7'
+
+    - debug:
+        msg: Decided to install mysql for MEP 6.2.0+ on RHEL/CentOS 8+
+      when: ansible_os_family == 'RedHat' and
+        ansible_distribution_major_version == '8' and
+        mysql_server_already_installed and not mariadb_server_already_installed
+
+    - debug:
+        msg: Decided to install mariadb for MEP 6.2.0+ on RHEL/CentOS 8+
+      when: ansible_os_family == 'RedHat' and
+        ansible_distribution_major_version == '8' and
+        mariadb_server_already_installed and not mysql_server_already_installed
+
+    - name: Installing mysql sql engine for RedHat 8
+      yum:
+        name: mysql,mysql-server,python3-PyMySQL
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: yum_installed_mysql_server_rhel8 is succeeded
+      register: yum_installed_mysql_server_rhel8
+      when: ansible_os_family == 'RedHat' and
+        ansible_distribution_major_version == '8' and
+        mysql_server_already_installed and not mariadb_server_already_installed
+
+    - name: Installing mariadb sql engine for RedHat 8
+      yum:
+        name: mariadb,mariadb-server,python3-PyMySQL,python2-PyMySQL
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: yum_installed_mariadb_server_rhel8 is succeeded
+      register: yum_installed_mariadb_server_rhel8
+      when: ansible_os_family == 'RedHat' and
+            ansible_distribution_major_version == '8' and
+            not mysql_server_already_installed
+
+  # workaround issues of linking with old libs
+    - shell: rpm -qa | fgrep mariadb-server | cut -d'-' -f3
+      when: ansible_os_family == 'RedHat' and
+          ansible_distribution_major_version == '7'
+      ignore_errors: True
+      register: mariadb_version
+
+  # If someone has installed packages from MariaDB directly, we end up here
+  # we don't currently support it - does not use systemd, nor do we know
+  # yet if the symlinks below works for it
+    - fail: msg="diststro package for mariadb-server not found - you likely have MariaDB-Server installed instead"
+      when: ansible_os_family == 'RedHat' and
+          ansible_distribution_major_version == '7' and
+          mariadb_version.stdout == ""
+
+    - set_fact: mariadb_version_quadruple={{ mariadb_version.stdout | regex_replace('\.','') }}
+      when: ( mariadb_version is not skipped ) and mariadb_version is succeeded
+
+    - shell: rpm -ivh --nodeps http://yum.mariadb.org/{{ mariadb_version.stdout
+          }}/rhel7-amd64/rpms/MariaDB-{{ mariadb_version.stdout
+          }}-centos7-x86_64-compat.rpm
+      when: mariadb_version_quadruple is defined and
+          mariadb_version_quadruple is version_compare('5544', '>')
+      ignore_errors: True
+      register: mariadb_compat_result
+
+  # log the failure
+    - debug:
+        var: mariadb_compat_result
+      when: mariadb_compat_result is defined
+
+    - name: Linking libsasl2.so.3.0.0 to libsasl2.so.2
+      shell: ln -s /lib64/libsasl2.so.3.0.0 /lib64/libsasl2.so.2
+      when: ansible_os_family == 'RedHat' and
+          ansible_distribution_major_version >= '7'
+      ignore_errors: True
+      register: link_sasl2_result
+
+  # log the failure
+    - debug:
+        var: link_sasl2_result
+      when: link_sasl2_result is failed
+
+    - name: Installing mysql for suse based OS
+      zypper:
+        name: mysql,python-mysql
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: zypper_installed_mysql_server is succeeded
+      register: zypper_installed_mysql_server
+      when: ansible_os_family == 'Suse' and ansible_distribution_major_version < '15'
+
+    - name: Installing mysql for suse based OS
+      zypper:
+        name: mariadb,python3-PyMySQL,python2-PyMySQL
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: zypper_installed_mariadb_server is succeeded
+      register: zypper_installed_mariadb_server
+      when: ansible_os_family == 'Suse' and ansible_distribution_major_version >= '15'
+
+    - name: Installing mysql for Ubuntu based OS
+      apt:
+        name: mysql-server,python-mysqldb
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: apt_installed_mysql_server is succeeded
+      register: apt_installed_mysql_server
+      when: ansible_os_family == 'Debian' and ansible_distribution_major_version < '20' and
+            not mariadb_server_already_installed and not mariadb_client_already_installed and
+            apt_installed_mariadb_client is skipped
+
+    - name: Installing mysql for Ubuntu based OS(U20+)
+      apt:
+        name: mysql-server
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: apt_installed_mysql_server_u20 is succeeded
+      register: apt_installed_mysql_server_u20
+      when: ansible_os_family == 'Debian' and ansible_distribution_major_version >= '20' and
+            not mariadb_server_already_installed and (mysql_client_already_installed or
+            (apt_installed_mysql_client is not skipped and apt_installed_mysql_client is succeeded))
+
+    - name: Installing mariadb for Ubuntu based OS
+      apt:
+        name: mariadb-server,python3-pymysql
+        state: present
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: apt_installed_mariadb_server is succeeded
+      register: apt_installed_mariadb_server
+      when: ansible_os_family == 'Debian' and ((ansible_distribution_major_version >= '20' and
+            not mysql_server_already_installed and (mariadb_client_already_installed or
+            (apt_installed_mariadb_client is not skipped and apt_installed_mariadb_client is succeeded))) or
+            (ansible_distribution_major_version == '18' and not mysql_server_already_installed and
+            not mysql_client_already_installed and apt_installed_mysql_client is skipped))
+
+
+    - name: Running ldconfig
+      command: ldconfig
+      ignore_errors: True
+
+    # close race condition after installing mariadb and enabling it
+    # systemd is slow to notice new files
+    - name: "Calling systemctl-daemon reload if systemd present."
+      shell: which systemctl >/dev/null 2>&1 && systemctl daemon-reload
+      ignore_errors: True
+      when: (ansible_os_family == 'RedHat' and ansible_distribution_major_version >= '7') or
+            (ansible_os_family == 'Debian' and ansible_distribution_major_version >= '18') or
+            (ansible_os_family == 'Suse' and ansible_distribution_major_version >= '15')
+
+    - name: Collecting packages info (after installing packages)
+      package_facts:
+        manager: "auto"
+
+    - name: Checking installed packages (after installing packages)
+      set_fact:
+        mariadb_server_installed: "{{ True if 'mariadb-server' in ansible_facts.packages else False }}"
+        mysql_server_installed: "{{ True if 'mysql-server' in ansible_facts.packages else False }}"
+      when: ansible_os_family == 'RedHat' or ansible_os_family == 'Debian'
+
+    - set_fact:
+        mariadb_server_installed: "{{ True if 'mariadb' in ansible_facts.packages else False }}"
+        mysql_server_installed: "{{ True if 'mysql' in ansible_facts.packages else False }}"
+      when: ansible_os_family == 'Suse'
+
+      # remember that we installed mysql/mariadb server pkgs
+    - file: path="{{ mapr_home }}/installer/data/mysql-server-installed" state=touch
+      when: mysql_server_installed and not mysql_db_already_installed
+
+    - file: path="{{ mapr_home }}/installer/data/mariadb-server-installed" state=touch
+      when: mariadb_server_installed and not mysql_db_already_installed
+
+    - set_fact: mysql_service_name=mysql
+      when: (mysql_server_installed or mysql_server_already_installed) and (ansible_os_family == 'Debian' or
+            ansible_os_family == 'Suse' or
+            (ansible_os_family == 'RedHat' and ansible_distribution_major_version == '7'))
+
+    - set_fact: mysql_service_name=mysqld
+      when: (mysql_server_installed or mysql_server_already_installed) and (ansible_os_family == 'RedHat' and
+            (ansible_distribution_major_version == '6' or
+            (ansible_distribution_major_version == '8' and mysql_server_installed)))
+
+    - set_fact: mysql_service_name=mariadb
+      when: (mariadb_server_installed or mariadb_server_already_installed) and
+            ((ansible_os_family == 'Debian' and ansible_distribution_major_version >= '18') or
+            (ansible_os_family == 'Suse') or
+            (ansible_os_family == 'RedHat' and ansible_distribution_major_version >= '7'))
+
+    - name: Removing bind-address directive from my.cnf
+      command: "sed -i -e '/^bind-address/s/^/#/' /etc/my.cnf"
+      when: ansible_os_family == 'RedHat' and
+          ansible_distribution_major_version == '6'
+
+    - name: Removing bind-address directive from my.cnf
+      command: "sed -i -e '/^bind-address/s/^/#/' /etc/mysql/my.cnf"
+      when: ansible_os_family == 'Debian' and ansible_distribution_major_version == '14'
+
+    - name: Removing bind-address directive from mysqld.cnf
+      command: "sed -i -e '/^bind-address/s/^/#/' /etc/mysql/mysql.conf.d/mysqld.cnf"
+      when: (ansible_os_family == 'Debian' and ansible_distribution_major_version >= '16') and
+            (mysql_server_already_installed or mysql_server_installed)
+
+    - name: Removing bind-address directive from 50-server.cnf
+      command: "sed -i -e '/^bind-address/s/^/#/' /etc/mysql/mariadb.conf.d/50-server.cnf"
+      when: (ansible_os_family == 'Debian' and ansible_distribution_major_version >= '20') and
+            (mariadb_server_already_installed or mariadb_server_installed)
+
+    - name: Removing bind-address directive from my.cnf
+      command: "sed -i -e '/^bind-address/s/^/#/' /etc/my.cnf"
+      when: ansible_os_family == 'Suse'
+
+    - name: Add sql server settings to Mariadb server (Ubuntu)
+      template:
+        force: yes  # Indicate that we should overwrite file even if it existed
+        src: 51-server.cnf.j2
+        dest: /etc/mysql/mariadb.conf.d/51-server.cnf
+        owner: root
+        group: root
+        mode: '644'
+      when: mariadb_server_installed and ansible_os_family == 'Debian'
+
+    - name: Add sql server settings to MySQL server
+      template:
+        force: yes  # Indicate that we should overwrite file even if it existed
+        src: 51-server.cnf.j2
+        dest: /etc/mysql/mysql.conf.d/51-server.cnf
+        owner: root
+        group: root
+        mode: '644'
+      when: mysql_server_installed and (ansible_os_family == 'Suse' or ansible_os_family == 'RedHat')
+
+    - debug: var=mysql_service_name
+
+    - name: Checking mysql service state
+      service:
+        name: "{{ mysql_service_name }}"
+        state: restarted
+        enabled: yes
+
+    - name: "Determine if we earlier installed mysql - like this iteration could be a retry"
+      stat: path="{{ mapr_home }}/installer/data/mysql-server-installed"
+      register: mysql_server_installed_by_installer
+
+    - name: "Determine if we earlier installed mariadb - like this iteration could be a retry"
+      stat: path="{{ mapr_home }}/installer/data/mariadb-server-installed"
+      register: mariadb_server_installed_by_installer
+
+    - set_fact:
+        mysql_db_installed_by_installer: "{{ True if (mysql_server_installed_by_installer or mariadb_server_installed_by_installer) else False }}"
+
+    - name: "check to see if mysql has been configured with password"
+      shell: "mysql -uroot < /dev/null"
+      ignore_errors: True
+      register: mysql_secured
+
+    - debug:
+        var: mysql_secured
+      when: mysql_secured is defined
+
+    - debug: msg="WARNING - you have an insecure MySql setup"
+      when: mysql_secured is succeeded and ("Access denied" not in mysql_secured.stderr) and
+            mysql_db_already_installed and not mysql_db_installed_by_installer
+
+    - debug: msg="WARNING - do not provide database admin password on subsequent incremental/upgrade installs"
+      when: mysql_secured is succeeded and ("Access denied" not in mysql_secured.stderr) and
+            mysql_db_already_installed and not mysql_db_installed_by_installer and admin_password != ''
+
+    # Ignore the given root password if the instance isn't secured
+    # and we didn't install it - allow us to continue wihout a failure
+    # The customer could have installed mysql/mariadb server for other
+    # application use so we cannot change it..
+    #
+    # only ignore the password if it is truly an existing installation
+    - set_fact: admin_password=''
+      when: mysql_secured is succeeded and ("Access denied" not in mysql_secured.stderr) and
+        mysql_db_already_installed and not mysql_db_installed_by_installer
+
+    - block:
+      - command: >
+          mysql --user=root --password="{{ admin_password }}" mysql --batch --skip-column-names -e "SELECT User,Host,Plugin from user where User = 'root';"
+        register: root_mysql_plugin_secure
+
+      #- debug: var=root_mysql_plugin
+      - command: >
+          mysql --user=root --password="{{ admin_password }}" mysql --batch --skip-column-names -e "UPDATE user SET plugin='mysql_native_password', authentication_string = PASSWORD('{{ admin_password }}') WHERE User='root';"
+        register: root_mysql_plugin_update_secure
+        when: root_mysql_plugin_secure is succeeded and 'auth_socket' in root_mysql_plugin_secure.stdout
+      when: mysql_secured is failed and ("Access denied" in mysql_secured.stderr)
+
+    - block:
+      - command: >
+          mysql --user=root mysql --batch --skip-column-names -e "SELECT User,Host,Plugin from user where User = 'root';"
+        register: root_mysql_plugin_insecure
+
+      #- debug: var=root_mysql_plugin
+      - command: >
+          mysql --user=root mysql --batch --skip-column-names -e "UPDATE user SET plugin='mysql_native_password', authentication_string = PASSWORD('{{ admin_password }}') WHERE User='root';"
+        register: root_mysql_plugin_update_insecure
+        when: root_mysql_plugin_insecure is succeeded and 'auth_socket' in root_mysql_plugin_insecure.stdout
+      when: mysql_secured is succeeded and ("Access denied" not in mysql_secured.stderr)
+
+    - name: Restart mysql service if plugin changed
+      service:
+        name: "{{ mysql_service_name }}"
+        state: restarted
+        enabled: yes
+      when: (root_mysql_plugin_update_secure is not skipped and root_mysql_plugin_update_secure is succeeded) or
+            (root_mysql_plugin_update_insecure is not skipped and root_mysql_plugin_update_insecure is succeeded)
+
+    - mysql_info:
+        login_user: root
+        login_password: "{{ admin_password }}"
+      register: mysql_info_secured
+      when: mysql_secured is failed and ("Access denied" in mysql_secured.stderr)
+
+    - debug: var=mysql_info_secured
+
+    - shell: echo 'show variables;' | mysql | grep "^socket" | awk '{print $2}'
+      register: mysql_info_insecure
+      when: mysql_secured is succeeded and ("Access denied" not in mysql_secured.stderr)
+
+    - debug: var=mysql_info_insecure
+
+    - set_fact:
+        mysql_socket: "{{ mysql_info_secured.settings.socket if (mysql_info_secured is not skipped and mysql_info_secured is succeeded) else mysql_info_insecure.stdout }}"
+
+    # set root password
+    # Need to be done after we update the auth_socket setting
+    # only happens if mysql were not already installed
+    - mysql_user:
+        name="root"
+        password="{{ admin_password }}"
+        host="{{ item }}"
+        check_implicit_admin=yes
+        login_unix_socket="{{ mysql_socket }}"
+        login_user="root"
+        login_password="{{ admin_password }}"
+      with_items:
+        - localhost
+        - 127.0.0.1
+        - ::1
+      no_log: True
+      when: ("Access denied" not in mysql_secured.stderr) and
+            ((not mysql_db_already_installed) or mysql_db_installed_by_installer) and admin_password != ''
+
+    # remove anonymous user for security
+    - mysql_user:
+        name=''
+        host_all=yes
+        login_user="root"
+        login_password="{{ admin_password }}"
+        login_unix_socket="{{ mysql_socket }}"
+        check_implicit_admin=yes
+        state=absent
+      no_log: True
+
+    # remove root user for remote host for security
+    - mysql_user:
+        name='root'
+        host="{{ item }}"
+        login_user="root"
+        login_password="{{ admin_password }}"
+        login_unix_socket="{{ mysql_socket }}"
+        check_implicit_admin=yes
+        state=absent
+      with_items:
+        - "{{ ansible_nodename }}"
+      no_log: True
+
+    # setup service database users
+    - mysql_user:
+        login_user="root"
+        login_password="{{ admin_password }}"
+        login_unix_socket="{{ mysql_socket }}"
+        check_implicit_admin=yes
+        name="{{ item.0.user }}"
+        password="{{ item.0.password }}"
+        priv="{{ item.0.name + '.*:ALL,GRANT' }}"
+        host="{{ item.1 }}"
+        state=present
+      with_nested:
+        - "{{ mapr.node.db.mysql_databases }}"
+        - [ '%', 'localhost', "{{ inventory_hostname|truncate(mysql_hname_lim,True,'',0) }}" ]
+      no_log: True
+
+    # drop test database for security
+    - mysql_db:
+        login_user="root"
+        login_password="{{ admin_password }}"
+        login_unix_socket="{{ mysql_socket }}"
+        check_implicit_admin=yes
+        name="test"
+        state=absent
+      no_log: True
+
+    # Add service databases
+    - mysql_db:
+        login_user="root"
+        login_password="{{ admin_password }}"
+        login_unix_socket="{{ mysql_socket }}"
+        check_implicit_admin=yes
+        name="{{ item.name }}"
+        state=present
+        encoding=utf8
+        collation=utf8_general_ci
+      with_items: "{{ mapr.node.db.mysql_databases }}"
+      no_log: True
+
+    when: mapr.node.db.install_mysql|bool == True
+
+  - mapr_state.py: state=15

@@ -1,0 +1,56 @@
+---
+#
+# Playbook Name:: clean creds
+#
+# Copyright 2017, MapR Technologies
+#
+#
+
+- name: Clean security creds
+  hosts: all
+  serial: "{{ forks }}"
+  gather_facts: False
+
+  tasks:
+  - local_action: file path='{{ mapr_home }}/installer/data/tmp/{{ item }}' state=absent
+    become: false
+    with_items:
+      - cldb.key
+      - dare.master.key
+      - maprserverticket
+      - ssl-client.xml
+      - ssl-server.xml
+      - ssl_keystore
+      - ssl_keystore-signed.pem
+      - ssl_keystore.csr
+      - ssl_keystore.p12
+      - ssl_keystore.pem
+      - ssl_truststore
+      - ssl_truststore.p12
+      - ssl_truststore.pem
+      - ssl_userkeystore
+      - ssl_userkeystore-signed.pem
+      - ssl_userkeystore.csr
+      - ssl_userkeystore.p12
+      - ssl_userkeystore.pem
+      - ssl_usertruststore
+      - ssl_usertruststore.p12
+      - ssl_usertruststore.pem
+      - ssl_keystore.bcfks
+      - ssl_keystore.bcfks.csr
+      - ssl_keystore-signed.pem
+      - ssl_truststore.bcfks
+      - ssl_userkeystore.bcfks
+      - ssl_userkeystore.bcfks.csr
+      - ssl_userkeystore-signed.pem
+      - ssl_usertruststore.bcfks
+      - maprtrustcreds.bcfks
+      - maprtrustcreds.jceks
+      - maprtrustcreds.conf
+      - maprkeycreds.bcfks
+      - maprkeycreds.jceks
+      - maprkeycreds.conf
+      - ca
+      - tokens.tgz
+    register: deleted_files
+    ignore_errors: True

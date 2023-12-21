@@ -1,0 +1,58 @@
+---
+
+# Google Cloud Instance Provisioning
+# Create GCE instances and register the instances with
+# MapR installer.
+
+- name: provision gce instances
+  gce_provision:
+    disk_count: "{{provider.config.disk_count}}"
+    disk_size: "{{provider.config.disk_size}}"
+    disk_type: "{{provider.config.disk_type}}"
+    disk_interface: "{{provider.config.disk_interface|default('SCSI')}}"
+    instance_group_name: "{{provider.config.instance_group_name}}"
+    host_count: "{{host_count}}"
+    name: "{{cluster_name}}"
+    ssh_key_pub: "{{ssh_id}}:{{provider.config.ssh_key_pub}}"
+    scale: "{{scale}}"
+    use_installer: "{{provider.config.use_installer|default(false)|bool}}"
+  register: gce
+
+- set_fact:
+    ips: "{{ gce.ips | difference(hosts) }}"
+
+- set_fact:
+    hosts: "{{ hosts }} + {{ ips }}"
+
+- mapr_state.py: state=16
+
+- name: wait for ssh access
+  wait_for:
+    host: "{{ item }}"
+    port: 22
+    delay: 2
+    sleep: 2
+    timeout: 120
+    active_connection_states:
+      - ESTABLISHED
+  with_items: "{{ ips }}"
+
+# Temporary workaround access to ssh issue
+- pause:
+    seconds: 10
+
+#- block:
+#  installer is part of the cluster
+#  when: not scale|bool and provider.config.use_installer|default(false)|bool
+
+- mapr_state.py: state=17
+
+- add_host:
+    hostname: "{{ item }}"
+    groupname: "provisioned_ips"
+  with_items: "{{ ips }}"
+
+- mapr_state.py: state=18
+
+
+

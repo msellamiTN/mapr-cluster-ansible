@@ -1,0 +1,368 @@
+---
+#
+# Playbook Name:: uninstall_mapr
+#
+# Copyright 2013, MapR Technologies
+#
+
+- name: Uninstalling DF packages
+  hosts: all
+  serial: "{{ forks }}"
+
+  vars:
+    cConfFile: "{{ mapr_home }}/conf/mapr-clusters.conf"
+    inst_tmp: "{{ mapr_home }}/installer/data/tmp"
+    mapr_pkgs_list: ""
+    mapr_top: "{{ mapr_home|default('/opt/mapr') }}"
+    repo_subdir: ""
+
+  tasks:
+  - set_fact: repo_subdir=/ubuntu
+    when: (not repo_full_url) and ansible_os_family == 'Debian'
+
+  - set_fact: repo_subdir=/redhat
+    when: (not repo_full_url) and ansible_os_family == 'RedHat'
+
+  - set_fact: repo_subdir=/suse
+    when: (not repo_full_url) and ansible_os_family == 'Suse'
+
+  - name: "Determine if we installed mysql-server"
+    stat: path="{{ mapr_home }}/installer/data/mysql-server-installed"
+    register: mysql_server_installed
+    check_mode: False
+
+  - name: "Determine if we installed mariadb-server"
+    stat: path="{{ mapr_home }}/installer/data/mariadb-server-installed"
+    register: mariadb_server_installed
+    check_mode: False
+
+  - name: "Determine if MapR was configured"
+    stat: path="{{ mapr_home }}/conf/mapr-clusters.conf"
+    register: mapr_configured
+    check_mode: False
+
+  - name: "Determine if ZK is present"
+    stat: path="{{ mapr_home }}/roles/zookeeper"
+    register: zookeeper_present
+    check_mode: False
+
+  - name: "Determine if Warden is present"
+    stat: path="{{ mapr_home }}/initscripts/mapr-warden"
+    register: warden_present
+    check_mode: False
+
+  - name: "Determine if pid directory is present"
+    stat: path="{{ mapr_home }}/pid"
+    register: mapr_pid_dir_present
+    check_mode: False
+
+  - name: "Make sure /mapr is unmounted"
+    shell: "umount -f -l /mapr"
+    check_mode: False
+    ignore_errors: True
+    register: umount_mapr
+
+  - debug: var=umount_mapr
+
+  - name: "Find MapR processes where pid are symbolic links"
+    shell: "find {{ mapr_home }}/pid -type l -print"
+    register: mapr_pid_symbolic_links
+    when: mapr_pid_dir_present.stat.exists|bool == True
+
+    # some pid files may go away while we look or some services remove the pid file when they exit but not the symlink
+  - name: "Find any running MapR processes where pid are symbolic links"
+    shell: "echo {{ mapr_pid_symbolic_links.stdout|regex_replace('\n',' ') }} | xargs ls -l | awk '{print $NF}' | xargs cat 2> /dev/null"
+    ignore_errors: True
+    register: mapr_symbolic_pids
+    when: mapr_pid_dir_present.stat.exists|bool == True and mapr_pid_symbolic_links is success and
+          mapr_pid_symbolic_links.stdout_lines|length > 0
+
+  - name: "Find any running MapR processes"
+    shell: "find {{ mapr_home }}/pid -type f -print | xargs cat 2> /dev/null"
+    ignore_errors: True
+    register: mapr_pids
+    when: mapr_pid_dir_present.stat.exists|bool == True
+
+  - name: "Stop Warden"
+    service: name=mapr-warden enabled=yes state=stopped
+    when: mapr_configured.stat.exists|bool == True and warden_present.stat.exists|bool == True
+    ignore_errors: True
+
+  - name: "Stop ZK"
+    service: name=mapr-zookeeper enabled=yes state=stopped
+    when: mapr_configured.stat.exists|bool == True and zookeeper_present.stat.exists|bool == True
+    ignore_errors: True
+
+  - name: Wait for processes to have time to die off
+    wait_for:
+      path: "{{ mapr_home }}/pid/warden.pid"
+      state: absent
+    become: False
+    ignore_errors: True
+    register: warden_success_shutdown
+
+  - name: kill orphan pids
+    command: "kill -9 {{ item }}"
+    ignore_errors: True
+    with_items:
+      - "{{ mapr_pids.stdout_lines }}"
+    when: mapr_pid_dir_present.stat.exists|bool == True and mapr_pids is success and
+          mapr_pids.stdout_lines is defined
+
+  - name: kill orphan pids
+    command: "kill -9 {{ item }}"
+    ignore_errors: True
+    with_items:
+      - "{{ mapr_symbolic_pids.stdout_lines }}"
+    when: mapr_pid_dir_present.stat.exists|bool == True and mapr_symbolic_pids is success and
+          mapr_symbolic_pids.stdout_lines is defined
+
+  - name: "Find installed MapR packages"
+    shell: "dpkg --get-selections | cut -f1 | grep mapr-"
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+    register: mapr_pkgs_deb
+
+  - set_fact: mapr_pkgs_list="{{ mapr_pkgs_deb.stdout | regex_replace('\n',',') }}"
+    ignore_errors: True
+    when: ansible_os_family == 'Debian' and mapr_pkgs_deb.rc == 0
+
+  - set_fact: mapr_pkgs_list="{{ mapr_pkgs_list | regex_replace('mapr-installer-definitions,*','') | regex_replace('mapr-installer,*','')}}"
+    ignore_errors: True
+    when: ansible_os_family == 'Debian' and mapr_pkgs_list != ''
+
+  - name: "Uninstall MapR packages"
+    apt: name="{{ mapr_pkgs_list }}" state=absent purge=yes force=yes
+    when: ansible_os_family == 'Debian' and mapr_pkgs_list != ''
+    register: pkg_remove_apt1
+    ignore_errors: True
+
+  # run it a second time to work around apt-get/dpkg purge deficiencies
+  - name: "Uninstall MapR packages - purge"
+    apt: name="{{ mapr_pkgs_list }}" state=absent purge=yes force=yes
+    when: ansible_os_family == 'Debian' and mapr_pkgs_list != ''
+    register: pkg_remove
+    ignore_errors: True
+
+  # force remove broken packages
+  - name: "Remove any leftover MapR package files"
+    shell: "ls /var/lib/dpkg/info/mapr-*rm | grep -v mapr-installer | xargs rm -f"
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - name: "Remove any unneeded MapR package dependencies"
+    command: apt-get -qq -y autoremove
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - name: "Find installed MapR Packages"
+    shell: "rpm -qa | grep mapr-"
+    when: ansible_os_family == 'RedHat' or ansible_os_family == 'Suse'
+    ignore_errors: True
+    register: mapr_pkgs_rh
+
+  - set_fact: mapr_pkgs_list="{{ mapr_pkgs_rh.stdout | regex_replace('\n',',') }}"
+    ignore_errors: True
+    when: (ansible_os_family == 'RedHat' or ansible_os_family == 'Suse') and mapr_pkgs_rh.rc == 0
+
+  - set_fact: mapr_pkgs_list="{{ mapr_pkgs_list | regex_replace('mapr-installer-definitions,*','') | regex_replace('mapr-installer,*','')}}"
+    ignore_errors: True
+    when: ansible_os_family == 'RedHat' or ansible_os_family == 'Suse' and mapr_pkgs_list != ''
+
+  - name: "Uninstall MapR Packages"
+    yum:
+      name: "{{ mapr_pkgs_list }}"
+      install_repoquery: false
+      disablerepo: "*"
+      enablerepo: "mapr_core, mapr_ecosystem"
+      state: removed
+    when: ansible_os_family == 'RedHat' and mapr_pkgs_list != ''
+    ignore_errors: True
+    register: pkg_remove
+
+  # zypper module does not like versions in the names
+  # mapr-collectd-5.7.1.201703111346-1.x86_64
+  - set_fact: mapr_pkgs_list="{{ mapr_pkgs_list | regex_replace('-[0-9]+\.[0-9]+(\.[0-9]+)*-[0-9]\.noarch','') | regex_replace('-[0-9]+\.[0-9]+(\.[0-9]+)*(\.GA)*-[0-9]+\.x86_64','') }}"
+    ignore_errors: True
+    when: ansible_os_family == 'Suse' and mapr_pkgs_list != ''
+
+  - name: "Uninstall MapR Packages"
+    zypper:
+      name: "{{ mapr_pkgs_list }}"
+      state: absent
+    when: ansible_os_family == 'Suse' and mapr_pkgs_list != ''
+    ignore_errors: True
+    register: pkg_remove
+
+  # log the failure
+  - debug: var=pkg_remove
+    when: pkg_remove is failed
+
+  - name: "Remove leftover MapR files and directories"
+    shell: "find /opt/mapr -maxdepth 1 -mindepth 1 -type d ! -path /opt/mapr/installer -exec rm -r {} \\;"
+    ignore_errors: True
+
+  - shell: "find /opt/mapr -maxdepth 1 -mindepth 1 -type f ! -path /opt/mapr/installer -exec rm -r {} \\;"
+    ignore_errors: True
+
+# remove repo files
+  - name: "Remove MapR repo files"
+    apt_repository: repo="deb {{ repo_core_url }}{{ repo_subdir }} mapr optional" state=absent
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - apt_repository: repo="deb {{ repo_core_url }}{{ repo_subdir }} binary/" state=absent
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - apt_repository: repo="deb {{ repo_core_url }}{{ repo_subdir }} binary trusty" state=absent
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - apt_repository: repo="deb {{ repo_eco_url }}{{ repo_subdir }} binary/" state=absent
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - apt_repository: repo="deb {{ repo_eco_url }}{{ repo_subdir }} binary trusty" state=absent
+    when: ansible_os_family == 'Debian'
+    ignore_errors: True
+
+  - name: "Remove MapR repo files"
+    zypper_repository: name=mapr_core repo="{{ repo_core_url }}{{ repo_subdir }}" state=absent
+    when: ansible_os_family == 'Suse'
+    ignore_errors: True
+
+  - zypper_repository: name=mapr_ecosystem repo="{{ repo_eco_url }}{{ repo_subdir }}" state=absent
+    when: ansible_os_family == 'Suse'
+    ignore_errors: True
+
+  - name: "Remove MapR repo files"
+    file: path={{ core_repo_file_redhat }} state=absent
+    when: ansible_os_family == 'RedHat'
+    ignore_errors: True
+
+  - file: path={{ eco_repo_file_redhat }} state=absent
+    when: ansible_os_family == 'RedHat'
+    ignore_errors: True
+
+  - name: "remove any leftover systemd files"
+    file: path="{{ item }}" state=absent
+    with_items:
+      - "/etc/systemd/system/mapr-warden.service"
+      - "/etc/systemd/system/mapr-zookeeper.service"
+      - "/etc/systemd/system/mapr-loopbacknfs.service"
+    ignore_errors: True
+
+  - name: "Remove installer tmp files"
+    local_action: file path="{{ inst_tmp }}/{{ item }}" state=absent
+    become: false
+    with_items:
+      - cldb.key
+      - dare.master.key
+      - maprserverticket
+      - ssl_keystore
+      - ssl_keystore.bcfks
+      - ssl_keystore-signed.pem
+      - ssl_keystore.csr
+      - ssl_keystore.bcfks.csr
+      - ssl_keystore.p12
+      - ssl_keystore.pem
+      - ssl_truststore
+      - ssl_truststore.bcfks
+      - ssl_truststore.p12
+      - ssl_truststore.pem
+      - ssl_userkeystore
+      - ssl_userkeystore.bcfks
+      - ssl_userkeystore-signed.pem
+      - ssl_userkeystore.csr
+      - ssl_userkeystore.bcfks.csr
+      - ssl_userkeystore.p12
+      - ssl_userkeystore.pem
+      - ssl_usertruststore
+      - ssl_usertruststore.bcfks
+      - ssl_usertruststore.p12
+      - ssl_usertruststore.pem
+      - maprtrustcreds.bcfks
+      - maprtrustcreds.jceks
+      - maprtrustcreds.conf
+      - maprkeycreds.bcfks
+      - maprkeycreds.jceks
+      - maprkeycreds.conf
+      - ssl-server.xml
+      - ssl-client.xml
+      - ca
+      - tokens.tgz
+    ignore_errors: True
+    # only remove these if we are doing a full uninstall, not uninstall of failed hosts
+    when: ansible_play_hosts|length == groups['all']|length or (forks > 1 and groups['all']|length == forks)
+
+  - local_action: file path={{ item }} state=absent
+    become: false
+    with_fileglob:
+      - "{{ inst_tmp }}/*.jks"
+      - "{{ inst_tmp }}/*.pem"
+      - "{{ inst_tmp }}/*.yml"
+    ignore_errors: True
+    # only remove these if we are doing a full uninstall, not uninstall of failed hosts
+    when: ansible_play_hosts|length == groups['all']|length or (forks > 1 and groups['all']|length == forks)
+
+    # cleanup mysql/mariadb install
+  - block:
+
+    - debug: var=ansible_os_family
+
+    - file: path="{{ mapr_home }}/installer/data/mysql-server-installed" state=absent
+      ignore_errors: True
+
+    - file: path="{{ mapr_home }}/installer/data/mariadb-server-installed" state=absent
+      ignore_errors: True
+
+    - block:
+      - yum: name="mariadb-server,mysql-server" state=absent
+
+      - file: name="/var/lib/mysql" state=absent
+      when: ansible_os_family == 'RedHat'
+      ignore_errors: True
+
+    - block:
+      - block:
+        - shell: dpkg -l | grep mysql-server | awk '{print $2}'
+          ignore_errors: True
+          register: mysql_pkgs_deb
+
+        - debug: var=mysql_pkgs_deb
+
+        - set_fact: mysql_pkgs_list="{{ mysql_pkgs_deb.stdout | regex_replace('\n',',') }}"
+
+        - apt: name="{{ mysql_pkgs_list }}" state=absent purge=yes force=yes
+          ignore_errors: True
+        when: mysql_server_installed.stat.exists|bool == True
+
+      - block:
+        - shell: dpkg -l | grep mariadb-server | awk '{print $2}'
+          ignore_errors: True
+          register: mariadb_pkgs_deb
+
+        - debug: var=mariadb_pkgs_deb
+
+        - set_fact: mariadb_pkgs_list="{{ mariadb_pkgs_deb.stdout | regex_replace('\n',',') }}"
+
+        - apt: name="{{ mariadb_pkgs_list }}" state=absent purge=yes force=yes
+          ignore_errors: True
+        when: mariadb_server_installed.stat.exists|bool == True
+
+      when: ansible_os_family == 'Debian'
+      ignore_errors: True
+
+    - block:
+      - zypper:
+          name: "mariadb-server,mysql-server"
+          state: absent
+
+      - file: name="/var/lib/mysql" state=absent
+      when: ansible_os_family == 'Suse'
+      ignore_errors: True
+
+    when: mysql_server_installed.stat.exists | bool == True or mariadb_server_installed.stat.exists|bool == True
+
+  - mapr_complete.py: command="uninstall"

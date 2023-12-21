@@ -1,0 +1,459 @@
+---
+#
+# Playbook Name:: install_packages
+#
+# Copyright 2013, MapR Technologies
+#
+
+- name: Installing Core
+  hosts: all
+  serial: "{{ forks }}"
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    pkgs: "{{ mapr.node.core_packages|sort|join(' ') }}"
+    zypper_force_resolution: 'no'
+    zypper_allow_vendor_change: ''
+    pkg_sign_check: ""
+    mapr_installer_patch_file: "/tmp/{{ patch_file|default('') }}"
+    old_commons_jar: "{{ mapr_home }}/hadoop/hadoop-2.7.0/share/hadoop/common/lib/commons-collections-3.2.2.jar"
+    new_commons_jar: "{{ mapr_home }}/lib/commons-collections4-4.1.jar"
+    systemd_service_path: '/etc/systemd/system/'
+    zookeeper_systemd_service_file: '{{ systemd_service_path }}/mapr-zookeeper.service'
+    zookeeper_systemd_service_initscript_file: '{{ mapr_home }}/initscripts/mapr-zookeeper.service'
+    warden_systemd_service_file: '{{ systemd_service_path }}/mapr-warden.service'
+    warden_systemd_service_initscript_file: '{{ mapr_home }}/initscripts/mapr-warden.service'
+    old_zookeeper_pid_file: '{{ mapr_home }}/zkdata/zookeeper_server.pid'
+    loopbacknfs_list:
+        - mapr-loopbacknfs
+    librdkafka_list:
+        - mapr-librdkafka
+    mapreduce_list:
+
+  tasks:
+  - name: Get MapR version
+    set_fact:
+      mapr_version_triple: "{{ version | replace('.', '') }}"
+
+  - name: We need mapr-mapreduce2 (Dropped after 611)?
+    set_fact:
+      mapreduce_list:
+        - mapr-mapreduce2
+    when: mapr_version_triple | int <= 611
+
+  - fail: msg="No core packages specified"
+    when: pkgs is not defined or pkgs == ''
+
+  - set_fact: orphan_services="{{ mapr.node.orphan_services|default([]) }}"
+
+  - block:
+
+    - set_fact: orphan_services="{{ mapreduce_list }} + {{ orphan_services }}"
+      when: ansible_os_family != 'Debian'
+    # apt-get is not able to remove the package even with a force option
+    - command: 'dpkg -r mapr_mapreduce2'
+      ignore_errors: True
+      when: ansible_os_family == 'Debian'
+    when: (command == 'upgrade' or command == 'rolling_upgrade') and mapr_version_triple | int == 620
+
+    # if we are installing nfs, remove loopbacknfs on incremental/upgrade
+  - set_fact: orphan_services="{{ orphan_services }} + {{ loopbacknfs_list }}"
+    when: pkgs.find('mapr-nfs') != -1 and command in [ 'upgrade', 'rolling_upgrade', 'install' ] and not is_fresh_install
+
+    # if we are not installing nfs, add loopbacknfs
+  - set_fact: pkgs="{{ pkgs }} {{ loopbacknfs_list|join(' ') }}"
+    when: pkgs.find('mapr-nfs') == -1
+
+  - block:
+    - debug:
+        msg: "Orphaned services: {{ mapr.node.orphan_services }}"
+      # make double sure we never remove librdkafka as core depends on it
+    - set_fact:
+        orphan_services: "{{ orphan_services | difference(librdkafka_list) }}"
+    - debug:
+        msg: "Removing orphaned services {{ orphan_services }}"
+
+    # Package manipulation below
+    - apt:
+        name: "{{ orphan_services }}"
+        state: absent
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: apt_orphan_services
+      until: apt_orphan_services is succeeded
+      when: ansible_os_family == 'Debian'
+
+    - yum:
+        name: "{{ orphan_services }}"
+        state: absent
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: yum_orphan_services
+      until: yum_orphan_services is succeeded
+      when: ansible_os_family == 'RedHat'
+
+    - zypper:
+        name: "{{ orphan_services }}"
+        state: absent
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      register: zypper_orphan_services
+      until: zypper_orphan_services is succeeded
+      when: ansible_os_family == 'Suse'
+    when: orphan_services is defined and orphan_services
+
+  - set_fact: pkgs="mapr-core-internal {{ pkgs }}"
+    when: pkgs.find('mapr-core') != -1
+
+  - set_fact: pkgs="mapr-hadoop-core mapr-mapreduce2 {{ pkgs }}"
+    when: pkgs.find('mapr-core') != -1 and mapr_version_triple | int < 620
+
+  - set_fact: pkgs="mapr-core-internal mapr-client mapr-hadoop-util {{ pkgs }}"
+    when: pkgs.find('mapr-core') != -1 and mapr_version_triple | int >= 620
+
+  - set_fact: pkgs="mapr-zk-internal {{ pkgs }}"
+    when: pkgs.find('mapr-zookeeper') != -1
+
+  - set_fact: pkgs="mapr-compat-suse {{ pkgs }}"
+    when: (not 'mapr-compat-suse' in pkgs) and ansible_os_family == 'Suse'
+
+  - debug:
+      msg: "installing {{ pkgs }} to {{ mapr_home }}"
+
+  - block:
+    - apt:
+        state: latest
+        name: "{{ pkgs | regex_replace(' ', ',')  }}*"
+      register: apt_install
+      retries: "{{ package_manager_retries }}"
+      until: apt_install is succeeded
+      delay: "{{ package_manager_delay_sec }}"
+      when: command != 'upgrade' and command != 'rolling_upgrade'
+
+    - block:
+      - apt:
+          state: latest
+          dpkg_options: 'force-confdef,force-confold,force-overwrite'
+          name: "{{ pkgs | regex_replace(' ', ',')  }}*"
+        register: apt_install_retry
+        retries: "{{ package_manager_retries }}"
+        until: apt_install_retry is succeeded
+        delay: "{{ package_manager_delay_sec }}"
+        when: command == 'upgrade' or command == 'rolling_upgrade'
+
+      rescue:
+        # Observed on 6.2.0 -> 7.0.0 on Ubuntu 18
+        - name: Trying to fix package installation with apt install -f
+          command: apt install -f
+
+        - apt:
+            state: latest
+            dpkg_options: 'force-confdef,force-confold,force-overwrite'
+            name: "{{ pkgs | regex_replace(' ', ',')  }}*"
+          register: apt_install_retry2
+          retries: "{{ package_manager_retries }}"
+          until: apt_install_retry2 is succeeded
+          delay: "{{ package_manager_delay_sec }}"
+          when: command == 'upgrade' or command == 'rolling_upgrade'
+
+    - shell: "dpkg -l mapr-\\* | grep -v mapr-installer | wc -l"
+      register: pkgs_installed_deb
+
+    - set_fact: pkgs_installed="{{ pkgs_installed_deb }}"
+      when: pkgs_installed_deb is succeeded
+
+    when: ansible_os_family == 'Debian'
+
+  - block:
+    - yum:
+        state: latest
+        name: "{{ pkgs | regex_replace(' ', ',') }}"
+      register: yum_install
+      retries: "{{ package_manager_retries }}"
+      until: yum_install is succeeded
+      delay: "{{ package_manager_delay_sec }}"
+
+    # Fixing things like below
+    #     "stderr": "warning: rpmdb: BDB2053 Freeing read locks for locker 0x962: 703929/139967502350080
+    #        warning: rpmdb: BDB2053 Freeing read locks for locker 0x964: 703929/139967502350080
+    #        warning: rpmdb: BDB2053 Freeing read locks for locker 0x965: 703929/139967502350080
+    #        warning: rpmdb: BDB2053 Freeing read locks for locker 0x966: 703929/139967502350080
+    - shell: yum clean all; dnf clean all; rpm --rebuilddb
+      when: prebuilt_image is not defined or prebuilt_image == False
+
+    - shell: "rpm -qa | grep mapr | grep -v mapr-installer | wc -l"
+      register: pkgs_installed_rh
+
+    - set_fact: pkgs_installed="{{ pkgs_installed_rh }}"
+      when: pkgs_installed_rh is succeeded
+    when: ansible_os_family == 'RedHat'
+
+  - block:
+    - set_fact: zypper_force_resolution='yes'
+      when: command == 'upgrade' or command == 'rolling_upgrade'
+
+    - set_fact: zypper_allow_vendor_change='--allow-vendor-change'
+      when: command == 'upgrade' or command == 'rolling_upgrade'
+
+    - zypper:
+        state: latest
+        force_resolution: "{{ zypper_force_resolution }}"
+        extra_args: "{{ zypper_allow_vendor_change }}"
+        name: "{{ pkgs | regex_replace(' ',',') }}"
+      register: zypper_install
+      retries: "{{ package_manager_retries }}"
+      until: zypper_install is succeeded
+      delay: "{{ package_manager_delay_sec }}"
+
+    - shell: "rpm -qa  mapr-\\* | grep -v mapr-installer | wc -l"
+      register: pkgs_installed_suse
+
+    - set_fact: pkgs_installed="{{ pkgs_installed_suse }}"
+      when: pkgs_installed_suse is succeeded
+    when: ansible_os_family == 'Suse'
+
+  - debug:
+      var: pkgs_installed
+    when: pkgs_installed is failed
+
+  - fail: msg="Package manager failed to install any MapR software. Check package manager configuration and try again"
+    when: pkgs_installed is failed or pkgs_installed.stdout|int == 0
+
+  # need to copy over patch file so that we can install it on each node
+  - name: Copying patch files
+    copy:
+        src="{{ mapr_home }}/installer/data/tmp/{{ patch_file }}"
+        dest="{{ mapr_installer_patch_file }}"
+        owner=root
+        group=root
+        mode=0644
+    register: patch_file_copied
+    when: patch_file is defined and patch_file
+
+  - apt:
+      state: present
+      deb: "{{ mapr_installer_patch_file }}"
+    register: apt_patch_install
+    retries: "{{ package_manager_retries }}"
+    until: apt_patch_install is succeeded
+    delay: "{{ package_manager_delay_sec }}"
+    when: ansible_os_family == 'Debian' and patch_file_copied is not skipped and patch_file_copied is succeeded
+
+  - yum:
+      state: latest
+      name: "{{ mapr_installer_patch_file }}"
+    register: yum_patch_install
+    retries: "{{ package_manager_retries }}"
+    until: yum_patch_install is succeeded
+    delay: "{{ package_manager_delay_sec }}"
+    when: ansible_os_family == 'RedHat' and patch_file_copied is not skipped and patch_file_copied is succeeded
+
+  - zypper:
+      state: latest
+      name: "{{ mapr_installer_patch_file }}"
+    register: zypper_patch_install
+    retries: "{{ package_manager_retries }}"
+    until: zypper_patch_install is succeeded
+    delay: "{{ package_manager_delay_sec }}"
+    when: ansible_os_family == 'Suse' and patch_file_copied is not skipped and patch_file_copied is succeeded
+
+  # remove patch file
+  - file: path="{{ mapr_installer_patch_file }}" state=absent
+    when: patch_file_copied is not skipped and patch_file_copied is succeeded
+
+  #  patch env.sh so we can avoid bug 22991 among other
+  #  we use the backrefs=yes to force ansible.builtin.lineinfile to do nothing if the regex doesn't match
+  - ansible.builtin.lineinfile:
+       dest="{{ mapr_home }}/conf/env.sh"
+       regexp="java_version=\$\(echo \"\$java_version\" \| head -n1 \| cut -d '.' -f 2\)"
+       line="                java_version=$(echo "$java_version" | fgrep version | head -n1 | cut -d '.' -f 2)"
+       backrefs=yes
+
+  - ansible.builtin.lineinfile:
+       dest="{{ mapr_home }}/conf/env.sh"
+       regexp="\[ -z \"\$java_version\" \] \|\| \[ \$java_version -le 6 \] \&\& unset JAVA_HOME"
+       line="                if [ -z "$java_version" ] || [ $java_version -le 6 ]; then\n                    unset JAVA_HOME\n                fi\n"
+       backrefs=yes
+
+  - ansible.builtin.lineinfile:
+       dest="{{ mapr_home }}/conf/env.sh"
+       regexp="export LD_PRELOAD=\$LIBPAM"
+       line="    export LD_PRELOAD=\"$LD_PRELOAD $LIBPAM\""
+       backrefs=yes
+
+  - replace:
+       path="{{ item }}"
+       regexp='^#(.*)python$'
+       replace='#\1python2'
+    ignore_errors: True
+    with_items:
+       - "{{ mapr_home }}/server/diskremove"
+       - "{{ mapr_home }}/server/disksetup"
+       - "{{ mapr_home }}/server/parse_instance_info.py"
+       - "{{ mapr_home }}/support/python/libMapRClientTest.py"
+    when: ansible_os_family == 'RedHat' and ansible_distribution_major_version|int == 8 and version >= '6.1.0' and version < '6.2.0'
+
+  # patch mapr-warden initscript for ubunut 16
+  - ansible.builtin.lineinfile:
+       dest="{{ mapr_home }}/initscripts/mapr-warden"
+       regexp='(^  if kill -0 .*then[^else]*)    echo "Warden started'
+       insertafter=" *echo \"Warden started\" >> \$logFile$"
+       line="    cat $pid > /sys/fs/cgroup/systemd/system.slice/mapr-warden.service/cgroup.procs"
+       state=present
+    when: ansible_distribution_version is version_compare('16.04', '>=')
+
+  #  Disable MapR services until configured
+  - stat: path="{{ mapr_home }}/roles/zookeeper"
+    register: zookeeper_present
+    check_mode: False
+
+  - stat: path="{{ mapr_home }}/initscripts/mapr-warden"
+    register: warden_present
+    check_mode: False
+
+  - name: Turning off zookeeper until we will finish configuration
+    service:
+      name: mapr-zookeeper
+      enabled: no
+      state: stopped
+    when: zookeeper_present.stat.exists|bool == True and
+          (is_fresh_install or mapr.node.installed|bool == False or changingSecuritySettingMT or
+           command == 'upgrade' or command == 'rolling_upgrade' or command == 'update' or command == 'scale')
+
+  - name: Turning off warden until we will finish configuration 
+    service:
+      name: mapr-warden
+      enabled: no
+      state: stopped
+    when: warden_present.stat.exists|bool == True and (is_fresh_install or
+                                                       (mapr.node.installed | bool == False) or
+                                                        changingSecuritySettingMT or
+                                                        command == 'upgrade' or
+                                                        command == 'rolling_upgrade' or
+                                                        command == 'update' or
+                                                        command == 'scale')
+
+  - block:
+    - stat: path="{{ warden_systemd_service_file }}"
+      register: warden_systemd_present
+      ignore_errors: True
+      check_mode: False
+
+    - block:
+      - file: name="/etc/init.d/mapr-warden" state=absent follow=no
+
+      - stat: path="{{ warden_systemd_service_initscript_file }}"
+        register: warden_service_initscripts
+        ignore_errors: True
+
+      - set_fact: warden_systemd_service_initscript_file="{{ mapr_home }}/installer/etc/systemd/mapr-warden.service"
+        when: not warden_service_initscripts.stat.exists
+
+      - copy: src="{{ warden_systemd_service_initscript_file }}" dest="{{ systemd_service_path }}" remote_src="{{ False if (warden_service_initscripts.stat.exists) else True }}"
+
+      - systemd: daemon_reload=yes
+
+      when: not warden_systemd_present.stat.exists and ansible_service_mgr == "systemd"
+
+    - stat: path="{{ zookeeper_systemd_service_file }}"
+      register: zookeeper_systemd_present
+      ignore_errors: True
+      check_mode: False
+
+    - block:
+      - file: name="/etc/init.d/mapr-zookeeper" state=absent follow=no
+
+      - stat: path="{{ zookeeper_systemd_service_initscript_file }}"
+        register: zookeeper_service_initscripts
+        ignore_errors: True
+
+      - set_fact:
+          zookeeper_systemd_service_initscript_file: "{{ mapr_home }}/installer/etc/systemd/mapr-zookeeper.service"
+        when: not zookeeper_service_initscripts.stat.exists
+
+      - copy:
+          src: "{{ zookeeper_systemd_service_initscript_file }}"
+          dest: "{{ systemd_service_path }}"
+
+      - name: systemD reload services
+        systemd:
+          daemon_reload: yes
+
+      when: zookeeper_present.stat.exists | bool == True and not zookeeper_systemd_present.stat.exists and ansible_service_mgr == "systemd"
+
+    when: ansible_os_family == 'Debian' and ansible_distribution_major_version is version_compare('16', '>=')
+
+  - block:
+    # patch warden and zookeeper init script if ebf has not been applied
+    - command: 'grep -q {{ old_zookeeper_pid_file }} {{ zookeeper_systemd_service_initscript_file }}'
+      register: old_zookeeper_pid
+      ignore_errors: True
+      check_mode: False
+
+    - replace:
+        path: "{{ item }}"
+        regexp: '^(.*)(RUN_AS_CMD=")su (.*)'
+        replace: '\1\2runuser \3'
+        backup: yes
+      with_items:
+        - '{{ mapr_home }}/initscripts/zookeeper'
+        - '{{ mapr_home }}/initscripts/mapr-warden'
+
+      when: old_zookeeper_pid is succeeded
+    when: ansible_service_mgr == "systemd"
+
+  #- command: cp "{{ old_commons_jar }}" "{{ mapr_home }}/lib"
+  #- file: name="{{ new_commons_jar }}" state=absent
+  - block:
+    - command: cp "{{ old_commons_jar }}" "{{ mapr_home }}/lib"
+
+    - file:
+        name: "{{ new_commons_jar }}"
+        state: absent
+    when: mapr_version_triple | int < 616
+
+  - name: get 4 digit version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3$4}'"
+    register: mapr_build_version_4digit
+    when: mapr_version_triple | int >= 620
+
+  - name: get 4 digit version
+    shell: "cat {{ mapr_home }}/MapRBuildVersion | awk -F. '{print $1$2$3 0}'"
+    register: mapr_build_version_3digit
+    when: mapr_version_triple | int < 620
+
+  - set_fact: mapr_version_quadruple={{ mapr_build_version_4digit.stdout }}
+    when: mapr_version_triple | int >= 620
+
+  - set_fact: mapr_version_quadruple={{ mapr_build_version_3digit.stdout }}
+    when: mapr_version_triple | int < 620
+
+  - stat: path="{{ mapr_home }}/lib/libibverbs.so"
+    register: libibverbs_present
+    check_mode: False
+
+  - stat: path="{{ mapr_home }}/lib/librdmacm.so"
+    register: librdmacm_present
+    check_mode: False
+
+  - name: fix rdma issue
+    command: mv {{ item }} {{ item }}.orig
+    ignore_errors: True
+    with_items:
+        - "{{ mapr_home }}/lib/libibverbs.so"
+        - "{{ mapr_home }}/lib/librdmacm.so"
+    when: mapr_version_quadruple|int >= 6200 and mapr_version_quadruple|int < 6202 and
+          libibverbs_present.stat.exists|bool == True and librdmacm_present.stat.exists|bool == True
+
+  - block:
+    - stat: path="{{ mapr_home }}/lib/libjemalloc.so.1"
+      register: libjemalloc_link
+
+    - file: path="{{ mapr_home }}/lib/libjemalloc.so.1" src=/usr/lib/x86_64-linux-gnu/libjemalloc.so.2 state=link
+      when: libjemalloc_link.stat.exists|bool == False
+    when: ansible_os_family == 'Debian' and ansible_distribution_version is version_compare('20.04', '>=')
+
+  - mapr_state.py: state=10

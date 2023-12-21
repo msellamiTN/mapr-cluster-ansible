@@ -1,0 +1,359 @@
+---
+#
+# Playbook Name:: os_base_redhat
+#
+# Copyright 2013, MapR Technologies
+#
+#    Sub-section of os_base.yml
+#
+
+- name: Configuring OS prerequisites
+  hosts: RedHat
+  serial: "{{ forks }}"
+  gather_facts: False
+  environment:
+    http_proxy: "{{ http_proxy }}"
+    https_proxy: "{{ https_proxy }}"
+    no_proxy: "{{ no_proxy }}"
+
+  vars:
+    mapr_rh_prereqs: "cronie,curl,device-mapper,gnupg2,iputils,libcap,libsysfs,lsof,lvm2,nc,nfs-utils,nss,\
+      sudo,syslinux,sysstat,wget,which,yum-utils,tzdata-java,coreutils"
+    mapr_rh7_prereqs: "python-devel, python3-devel, sdparm, python2-PyMySQL, python36-PyMySQL"
+    mapr_rh8_prereqs: "libibverbs, python3-devel, python2-devel, python3-rpm, python2-PyMySQL, python3-PyMySQL, rdma, \
+      sg3_utils"
+    mapr_rh8_prereqs_core61: "compat-openssl10"
+    mapr_rh_ntp_daemons:
+      - ntp
+      - chrony
+    swap_val: 0
+    core_pkgs: "{{ mapr.node.core_packages|sort|join(' ') }}"
+
+  tasks:
+
+  - set_fact: swap_val=1
+    when: ansible_kernel is version_compare('2.6.32', '>')
+
+  - set_fact: epel_rpm_url="
+       {% if ansible_distribution_major_version|int == 5 %}{{ latest_epel54_rpm_url }}
+       {% elif ansible_distribution_major_version|int == 6 %}{{ latest_epel6_rpm_url }}
+       {% elif ansible_distribution_major_version|int == 7 %}{{ latest_epel7_rpm_url }}
+       {% elif ansible_distribution_major_version|int == 8 %}{{ latest_epel8_rpm_url }}
+       {% endif %}
+       "
+    when: (ansible_distribution == 'RedHat' or ansible_distribution == 'CentOS')
+
+  - set_fact: epel_rpm_url="
+       {% if ansible_distribution_major_version|int == 7 %}{{ oracle_linux_7_epel }}
+       {% elif ansible_distribution_major_version|int == 8 %}{{ oracle_linux_8_epel }}
+       {% endif %}
+       "
+    when: (ansible_distribution == 'Oracle Linux')
+
+  - set_fact: epel_rpm_url="
+       {% if ansible_distribution_major_version|int == 7 %}{{ rocky_linux_7_epel }}
+       {% elif ansible_distribution_major_version|int == 8 %}{{ rocky_linux_8_epel }}
+       {% endif %}
+       "
+    when: (ansible_distribution == 'Rocky')
+
+  # remove potential stale repo files
+  - file: path={{ core_repo_file_redhat }} state=absent
+    ignore_errors: True
+    register: core_repo_file_rm
+
+  - file: path={{ eco_repo_file_redhat }} state=absent
+    ignore_errors: True
+    register: eco_repo_file_rm
+
+  # log the failure
+  - debug: var=core_repo_file_rm
+    when: core_repo_file_rm is failed
+
+  - debug: var=eco_repo_file_rm
+    when: eco_repo_file_rm is failed
+
+  # Detect repo issues early
+  - command: yum repoinfo
+    check_mode: False
+    when: ansible_distribution_major_version|int >= 7
+
+  - command: yum repolist
+    check_mode: False
+    when: ansible_distribution_major_version|int < 7
+
+  - block:
+    - command: yum -q list installed epel-release warn=False
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: epel_pkg is succeeded
+      check_mode: False
+      ignore_errors: True
+      register: epel_pkg
+
+    # log the failure
+    - debug: var=epel_pkg
+      when: epel_pkg is failed
+
+    - yum:
+        name: "epel-release"
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      ignore_errors: True
+      until: epel_install is succeeded
+      register: epel_install
+      when: epel_pkg.rc != 0 and not no_internet
+
+    - yum:
+        name: "{{ epel_rpm_url }}"
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      ignore_errors: True
+      until: epel_install is succeeded
+      register: epel_install
+      when: epel_pkg.rc != 0 and not no_internet and epel_install is failed
+
+    # log epel install failures
+    - debug: var=epel_install
+      when: epel_install is failed
+
+    - fail: msg="Cannot download EPEL repository. If you are running the installation behind a firewall please set up EPEL making sure that the package epel-release is present on this node."
+      when: epel_install is failed and not no_internet
+
+    - stat: path="/etc/yum.repos.d/epel.repo"
+      check_mode: False
+      register: epel_repo_file
+
+    - ini_file: dest=/etc/yum.repos.d/epel.repo
+        section="epel"
+        option="enabled"
+        value="1"
+        state=present
+      when: epel_pkg.rc != 0 and epel_repo_file.stat.exists|bool == True and not no_internet
+
+    - name: Installing latest ca-certificates
+      yum:
+        name: ca-certificates
+        disablerepo: epel
+        state: latest
+      retries: "{{ package_manager_retries }}"
+      delay: "{{ package_manager_delay_sec }}"
+      until: yum_cacerts_install is succeeded
+      register: yum_cacerts_install
+      ignore_errors: True
+
+    when: ansible_distribution_major_version|int < 7 or core_pkgs is search("mapr-metrics")
+
+  # First step; disable SELINUX on RedHat systems
+  # setenforce returns an error if it's already disabled so swallow it
+  #   Bug 12491: libselinux-python module needed
+  #   for the "actions" to work
+  #
+  #   It is not always guaranteed that the Redhat based hosts, will have
+  #   selinux properly configured. Eg: Certain EC2 AMI's for CentOS.
+  #
+  - name: Installing latest libselinux-python
+    yum:
+      name: libselinux-python
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_selinux_install is succeeded
+    register: yum_selinux_install
+    when: ansible_distribution_major_version|int < 8
+
+  - name: Installing latest python3-libselinux
+    yum:
+      name: python3-libselinux
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_python3_selinux_install is succeeded
+    register: yum_python3_selinux_install
+    when: ansible_distribution_major_version|int >= 8
+
+  - stat: path="/etc/sysconfig/selinux"
+    check_mode: False
+    register: selinux_config
+
+  - selinux: policy=targeted state=disabled
+    ignore_errors: True
+    when: selinux_config.stat.exists|bool == True
+
+  - name: Turning off SELinux with setenforce 0
+    shell: '/usr/sbin/setenforce 0 || /bin/true'
+
+  - stat: path="/selinux"
+    check_mode: False
+    register: selinux_dir
+
+  - name: Turning off SELinux with echo 0 > /selinux/enforce
+    shell: 'echo 0 > /selinux/enforce'
+    ignore_errors: True
+    when: selinux_dir.stat.exists|bool == True
+
+  - stat: path="/sys/fs/selinux"
+    check_mode: False
+    register: selinux_dir
+
+  - name: Turning off SELinux with echo 0 > /sys/fs/selinux/enforce
+    shell: 'echo 0 > /sys/fs/selinux/enforce'
+    ignore_errors: True
+    when: selinux_dir.stat.exists|bool == True
+
+  # RedHat/CentOS distributions need an extra package (nc)
+  # to avoid pulling in the suse-compat package incorrectly
+  - name: Installing prereqs for RedHat based systems
+    yum:
+      name: "{{ mapr_rh_prereqs }}"
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_prereq_install is succeeded
+    register: yum_prereq_install
+
+  - name: Installing prereqs for RedHat 7 based systems
+    yum:
+      name: "{{ mapr_rh7_prereqs }}"
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_rh7_install is succeeded
+    register: yum_rh7_install
+    when: ansible_distribution_major_version|int < 8
+
+  - name: Installing prereqs for RedHat 8 based systems
+    yum:
+      name: "{{ mapr_rh8_prereqs }}"
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_rh8_install is succeeded
+    register: yum_rh8_install
+    when: ansible_distribution_major_version|int >= 8
+
+  - name: Installing prereqs for RedHat 8 based systems for core61
+    yum:
+      name: "{{ mapr_rh8_prereqs_core61 }}"
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_rh8_core61__install is succeeded
+    register: yum_rh8_core61__install
+    when: ansible_distribution_major_version|int >= 8 and version >= '6.1.0' and version < '6.2.0'
+
+  - name: Check to see if any of the ntp daemons are installed
+    shell: rpm -qa | grep "{{ item }}-"
+    ignore_errors: True
+    register: ntp_daemons_installed
+    with_items: "{{ mapr_rh_ntp_daemons }}"
+
+  - debug: var=ntp_daemons_installed
+
+  - name: determine which ntp daemon is installed
+    set_fact:
+      ntp_daemon_installed: "{%if item.stdout_lines|length > 0 %}{{ item.stdout_lines[0]|regex_replace('-.*','') }}{%endif%}"
+    when: item.stdout_lines|length > 0
+    with_items: "{{ ntp_daemons_installed.results }}"
+
+  - debug: var=ntp_daemon_installed
+
+  # Other helpful packages ... but not critical
+  - name: Installing clustershell,ethtool,pdsh
+    yum:
+      name: clustershell,ethtool,pdsh
+      state: latest
+    retries: "{{ package_manager_retries }}"
+    delay: "{{ package_manager_delay_sec }}"
+    until: yum_clush_install is succeeded
+    register: yum_clush_install
+    ignore_errors: True
+
+  - name: Setting net.ipv4.tcp_retries to 5
+    sysctl: name="net.ipv4.tcp_retries2" value=5 state=present ignoreerrors=yes
+
+  - name: Setting vm.overcommit_memory to 0
+    sysctl: name=vm.overcommit_memory value=0 state=present ignoreerrors=yes
+
+  - name: Setting vm.swappiness to {{ swap_val }}
+    sysctl: name=vm.swappiness value={{ swap_val }} state=present ignoreerrors=yes
+
+  - block:
+    - block:
+      - name: install chrony if no ntp daemon installed
+        yum:
+          name: chrony
+          state: latest
+        retries: "{{ package_manager_retries }}"
+        delay: "{{ package_manager_delay_sec }}"
+        until: yum_chrony_install is succeeded
+        register: yum_chrony_install
+
+      - name: remember we installed chrony
+        set_fact: ntp_daemon_installed=chrony
+
+      when: ntp_daemon_installed is not defined
+    when: ansible_distribution_version is version_compare('7.0', '>=')
+
+  - block:
+    - block:
+      - name: install ntp if no ntp daemon installed
+        yum:
+          name: ntp
+          state: latest
+        retries: "{{ package_manager_retries }}"
+        delay: "{{ package_manager_delay_sec }}"
+        until: yum_ntp_install is succeeded
+        register: yum_ntp_install
+
+      - name: remember we installed ntp
+        set_fact: ntp_daemon_installed=ntp
+
+      when: ntp_daemon_installed is not defined
+    when: ansible_distribution_version is version_compare('7.0', '<')
+
+  - name: Restarting chrony
+    service: name=chronyd state=started enabled=yes
+    when: ntp_daemon_installed == 'chrony'
+
+  - name: Restarting ntp
+    service: name=ntpd state=started enabled=yes
+    when: ntp_daemon_installed == 'ntp'
+
+  - name: Checking if rpcbind is started
+    service: name=rpcbind enabled=yes state=started
+
+  - debug: var=ansible_distribution_version
+
+  - name: Checking if nfslock is started
+    service: name=nfslock enabled=yes state=started
+    when: ansible_distribution_version is version_compare('7.0', '<')
+
+  - stat: path="/usr/share/mlnx_ofed"
+    register: ofed_present
+
+  - stat: path="/usr/lib/systemd/system/rdma.service"
+    register: rdma_service_present
+
+  - stat: path="/usr/lib/systemd/system/rdma-ndd.service"
+    register: rdma_ndd_service_present
+
+  - name: Checking if rdma is started
+    service: name=rdma enabled=yes state=started
+    when: ansible_distribution_version is version_compare('8.0', '>') and
+          rdma_service_present.stat.exists|bool == True and ofed_present.stat.exists|bool == False
+
+  - name: Checking if rdma is started
+    service: name=rdma-ndd enabled=yes state=started
+    when: ansible_distribution_version is version_compare('8.0', '>') and
+          rdma_ndd_service_present.stat.exists|bool == True and ofed_present.stat.exists|bool == False
+
+  # TODO: Removing enabled=yes since there is a systemd bug for RH7.1: 1159308
+  - name: Checking if nfs-lock is started 
+    service: name=nfs-lock state=started
+    when: ansible_distribution_version is version_compare('7.0', '>=') and
+          ansible_distribution_version is version_compare('8.0', '<')
+
+
+  - mapr_state.py: state=2
